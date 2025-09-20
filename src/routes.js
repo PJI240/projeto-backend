@@ -1,8 +1,15 @@
 const { Router } = require('express');
-const { homeController } = require('./controllers/home.controller');
+const { HomeController } = require('./controllers/home.controller');
+const { UsuariosController } = require('./controllers/usuarios.controller');
 
 const home_routes = Router();
+const usuarios_routes = Router();
 
-home_routes.get('/', homeController)
+// HOME
+home_routes.get('/', HomeController.show);
 
-exports.home_routes;
+// USUARIOS
+usuarios_routes.get('/', UsuariosController.list);
+usuarios_routes.post('/', UsuariosController.create);
+
+module.exports = { home_routes, usuarios_routes };
