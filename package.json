@@ -8,11 +8,14 @@
   "main": "index.js",
   "scripts": {
     "dev": "node src/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:dbconection": "node src/scripts/test-db.js"
   },
   "dependencies": {
     "express": "^5.1.0",
     "mysql2": "^3.15.0",
-    "sequelize": "^6.37.7"
+    "sequelize": "^6.37.7",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
   }
 }
