@@ -1,11 +1,11 @@
 // /backend/src/server.js
-require('dotenv').config(); // <<< carrega .env (local) e permite PORT no Railway
+require('dotenv').config(); 
 
 const { home_routes, usuarios_routes } = require('./routes');
 const { swaggerUi, swaggerSpec } = require('./config/swagger');
 
 const express = require('express');
-const health_routes = require('./routes/health'); // <<< rota nova de health
+const health_routes = require('./routes/health'); 
 const app = express();
 
 // middlewares
@@ -17,9 +17,9 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 // routes
 app.use('/', home_routes);
 app.use('/usuarios', usuarios_routes);
-app.use('/health', health_routes); // <<< GET /health
+app.use('/health', health_routes); 
 
-const port = process.env.PORT || 3000; // <<< usa a porta do Railway quando em produção
+const port = process.env.PORT || 3000; 
 app.listen(port, () => {
   console.log(`Servidor rodando na porta ${port}`);
 });
