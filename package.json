@@ -7,13 +7,13 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "start": "node src/server.js",          // usado pelo Railway
-    "dev": "node --watch src/server.js",    // útil para desenvolvimento local
+    "start": "node src/server.js",          
+    "dev": "node --watch src/server.js",    
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:dbconection": "node src/scripts/test-db.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",                    // <<< adicionado
+    "dotenv": "^16.4.5",                    
     "express": "^5.1.0",
     "mysql2": "^3.15.0",
     "sequelize": "^6.37.7",
