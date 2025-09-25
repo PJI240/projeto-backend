@@ -1,13 +1,21 @@
 {
   "name": "projeto-backend",
   "version": "1.0.0",
+<<<<<<< HEAD
   "type": "module",
   "main": "src/index.js",
+=======
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+>>>>>>> 8a41149 (feat: backend com login integrado ao Railway)
   "scripts": {
     "dev": "nodemon --watch src --ext js --exec node src/index.js",
     "start": "node src/index.js"
   },
   "dependencies": {
+<<<<<<< HEAD
     "bcrypt": "^5.1.1",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -20,5 +28,24 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.4"
+=======
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.15.1",
+    "sequelize": "^6.37.7",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
+  },
+  "keywords": [],
+  "description": "",
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+>>>>>>> 8a41149 (feat: backend com login integrado ao Railway)
   }
 }
