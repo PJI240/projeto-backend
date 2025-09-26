@@ -1,30 +1,46 @@
 import mysql from "mysql2/promise";
 
-console.log('🔍 Configurando conexão com banco...');
-console.log('DATABASE_URL:', process.env.DATABASE_URL ? '✅ Configurada' : '❌ Não encontrada');
+console.log('=== CONFIGURAÇÃO DO BANCO ===');
+console.log('DATABASE_URL:', process.env.DATABASE_URL ? 'PRESENTE' : 'AUSENTE');
+console.log('NODE_ENV:', process.env.NODE_ENV);
 
-// Conexão direta para Railway
-const pool = mysql.createPool({
+// FORÇAR uso da DATABASE_URL do Railway
+if (!process.env.DATABASE_URL) {
+  console.error('❌ DATABASE_URL não encontrada! Configure no Railway.');
+  process.exit(1);
+}
+
+// Configuração explícita
+const config = {
   uri: process.env.DATABASE_URL,
   waitForConnections: true,
   connectionLimit: 10,
-  namedPlaceholders: true,
-  connectTimeout: 10000,
-  acquireTimeout: 10000,
-  timeout: 10000,
+  queueLimit: 0,
+  connectTimeout: 60000,
+  acquireTimeout: 60000,
+  timeout: 60000,
+  reconnect: true,
+  namedPlaceholders: true
+};
+
+console.log('Tentando conectar com:', {
+  host: new URL(process.env.DATABASE_URL).hostname,
+  port: new URL(process.env.DATABASE_URL).port,
+  database: new URL(process.env.DATABASE_URL).pathname.replace('/', '')
 });
 
-// Teste de conexão
-pool.getConnection()
-  .then((connection) => {
-    console.log('✅ Conectado ao MySQL com sucesso!');
-    connection.release();
+const pool = mysql.createPool(config);
+
+// Teste de conexão imediato
+pool.execute('SELECT 1 + 1 AS result')
+  .then(([rows]) => {
+    console.log('✅ Teste de conexão bem-sucedido:', rows);
   })
-  .catch((error) => {
-    console.error('❌ Erro de conexão MySQL:');
-    console.error('Mensagem:', error.message);
-    console.error('Código:', error.code);
-    console.error('Endereço:', error.address, 'Porta:', error.port);
+  .catch(err => {
+    console.error('❌ Falha no teste de conexão:');
+    console.error('Mensagem:', err.message);
+    console.error('Código:', err.code);
+    console.error('Stack:', err.stack);
   });
 
 export { pool };
