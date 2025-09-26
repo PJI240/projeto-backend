@@ -42,17 +42,17 @@ router.post("/register", async (req, res) => {
     // hash da senha
     const hash = await bcrypt.hash(senha, 10);
 
-    // tenta inserir na coluna senha_hash, caso não exista, tenta inserir em senha (fallback)
+    // tenta inserir na coluna senha, caso não exista, tenta inserir em senha (fallback)
     try {
       await pool.query(
-        "INSERT INTO usuarios (nome, email, senha_hash, ativo) VALUES (?, ?, ?, 1)",
+        "INSERT INTO usuarios (nome, email, senha, 1) VALUES (?, ?, ?, 1)",
         [nome, email, hash]
       );
     } catch (insertErr) {
-      // se coluna senha_hash não existe, tenta coluna senha (compatibilidade)
+      // se coluna senha não existe, tenta coluna senha (compatibilidade)
       if (String(insertErr.message || "").toLowerCase().includes("unknown column")) {
         await pool.query(
-          "INSERT INTO usuarios (nome, email, senha, ativo) VALUES (?, ?, ?, 1)",
+          "INSERT INTO usuarios (nome, email, senha, 1) VALUES (?, ?, ?, 1)",
           [nome, email, hash]
         );
       } else {
