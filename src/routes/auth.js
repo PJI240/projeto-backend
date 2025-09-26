@@ -7,18 +7,16 @@ const router = Router();
 
 /**
  * Opções de cookie:
- * - Em produção (Railway, HTTPS, domínios diferentes): secure + SameSite=none
- * - Em dev/local: lax + secure=false
- * - Permite override por env: COOKIE_SECURE, COOKIE_SAMESITE
+ * - Produção (Railway, HTTPS, domínios diferentes): secure + SameSite=none
+ * - Dev/local: lax + secure=false
+ * - Override por env: COOKIE_SECURE, COOKIE_SAMESITE
  */
 function cookieOptions() {
   const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
-  // valores opcionais vindos do ambiente
   const envSecure = String(process.env.COOKIE_SECURE || "").toLowerCase();
   const envSameSite = (process.env.COOKIE_SAMESITE || "").toLowerCase();
 
-  // defaults
   let secure = false;
   let sameSite = "lax";
 
@@ -27,12 +25,10 @@ function cookieOptions() {
     sameSite = "none";
   }
 
-  // overrides por env (opcionais)
   if (envSecure === "true") secure = true;
   if (envSecure === "false") secure = false;
   if (["lax", "strict", "none"].includes(envSameSite)) sameSite = envSameSite;
 
-  // navegadores exigem secure quando SameSite=none
   if (sameSite === "none" && !secure) secure = true;
 
   return {
@@ -56,9 +52,9 @@ router.post("/login", async (req, res) => {
     senha = String(senha);
 
     const [rows] = await pool.query(
-      `SELECT id, nome, email, senha AS senhaHash, ativo
+      `SELECT id, nome, email, senha AS senhaDb, ativo
          FROM usuarios
-        WHERE LOWER(email) = ? 
+        WHERE LOWER(email) = ?
         LIMIT 1`,
       [email]
     );
@@ -68,8 +64,18 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
-    const ok = await bcrypt.compare(senha, String(user.senhaHash || ""));
-    if (!ok) {
+    // Se senha for hash bcrypt ($2a/$2b/$2y), compara com bcrypt; senão compara texto simples (temporário)
+    const stored = String(user.senhaDb ?? "");
+    const seemsBcrypt = /^\$2[aby]\$/.test(stored);
+
+    let passwordOK = false;
+    if (seemsBcrypt) {
+      passwordOK = await bcrypt.compare(senha, stored);
+    } else {
+      passwordOK = senha === stored; // ⚠️ temporário – ideal migrar para hash
+    }
+
+    if (!passwordOK) {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
@@ -100,8 +106,7 @@ router.get("/me", (req, res) => {
       ok: true,
       user: { id: payload.sub, email: payload.email, nome: payload.nome },
     });
-  } catch (e) {
-    // token inválido/expirado → sem erro duro; apenas sem sessão
+  } catch (_e) {
     return res.json({ ok: true, user: null });
   }
 });
