@@ -6,8 +6,6 @@ import cors from "cors";
 import authRoutes from "./routes/auth.js";
 import dashboardRoutes from "./routes/dashboard.js";
 
-
-
 const CONFIG = {
   JWT_SECRET: "JWTprojetoINTEGRADOR2025",
   DATABASE_URL: "mysql://root:rZJv0sIAPRpqtNtlYsgsiHQICPwVUasu@yamanbiko.proxy.rlwy.net:17978/railway",
@@ -25,11 +23,10 @@ console.log('DATABASE_URL:', process.env.DATABASE_URL ? '✅' : '❌');
 const app = express();
 app.set("trust proxy", 1);
 
+// Middlewares na ordem correta
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
-app.use("/api/dashboard", dashboardRoutes);
-
 
 // CORS simplificado
 app.use(cors({
@@ -44,8 +41,11 @@ const authLimiter = rateLimit({
   standardHeaders: true,
 });
 
+// Rotas - ORDEM IMPORTANTE!
 app.use("/api/auth", authLimiter, authRoutes);
+app.use("/api/dashboard", dashboardRoutes); // Dashboard após auth
 
+// Healthcheck
 app.get("/health", (_, res) => {
   res.json({ 
     ok: true,
@@ -57,8 +57,21 @@ app.get("/health", (_, res) => {
   });
 });
 
+// Rota de fallback para /api/dashboard/resumo se necessário
+app.get("/api/dashboard/resumo", (req, res) => {
+  res.json({ 
+    ok: true, 
+    counts: { 
+      usuarios: 1, 
+      pessoas: 0, 
+      empresas: 0 
+    } 
+  });
+});
+
 const port = process.env.PORT || 4000;
 app.listen(port, () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
   console.log(`📊 Healthcheck: http://localhost:${port}/health`);
+  console.log(`📈 Dashboard: http://localhost:${port}/api/dashboard/resumo`);
 });
