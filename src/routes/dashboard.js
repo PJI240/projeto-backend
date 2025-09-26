@@ -1,32 +1,47 @@
 // src/routes/dashboard.js
 import { Router } from "express";
-import { pool } from "../db.js"; 
+import { pool } from "../db.js";
 
 const router = Router();
 
-/**
- * GET /api/dashboard/resumo
- * Totais básicos do sistema (campos reais do seu schema)
- */
-router.get("/resumo", async (_req, res) => {
+// Middleware para verificar autenticação
+const requireAuth = (req, res, next) => {
+  const { token } = req.cookies || {};
+  
+  if (!token) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  
   try {
-    const [usuariosP, pessoasP, empresasP] = await Promise.all([
-      pool.query("SELECT COUNT(*) AS total FROM usuarios WHERE ativo = TRUE"),
-      pool.query("SELECT COUNT(*) AS total FROM pessoas"),
-      pool.query("SELECT COUNT(*) AS total FROM empresas WHERE ativa = TRUE"),
-    ]);
+    // Verifica o token JWT
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (error) {
+    return res.status(401).json({ ok: false, error: "invalid_token" });
+  }
+};
 
-    const usuarios = usuariosP[0][0]?.total ?? 0;
-    const pessoas  = pessoasP[0][0]?.total ?? 0;
-    const empresas = empresasP[0][0]?.total ?? 0;
+// Rota do resumo do dashboard
+router.get("/resumo", requireAuth, async (req, res) => {
+  try {
+    // Busca contagens do banco (exemplo - ajuste conforme suas tabelas)
+    const [usuariosRows] = await pool.query("SELECT COUNT(*) as count FROM usuarios WHERE ativo = 1");
+    const [pessoasRows] = await pool.query("SELECT COUNT(*) as count FROM pessoas");
+    const [empresasRows] = await pool.query("SELECT COUNT(*) as count FROM empresas WHERE ativa = 1");
+
+    const counts = {
+      usuarios: usuariosRows[0].count,
+      pessoas: pessoasRows[0].count,
+      empresas: empresasRows[0].count
+    };
 
     res.json({
       ok: true,
-      counts: { usuarios, pessoas, empresas },
-      generated_at: new Date().toISOString(),
+      counts
     });
-  } catch (err) {
-    console.error("DASHBOARD_RESUMO_ERROR", err);
+  } catch (error) {
+    console.error("DASHBOARD_RESUMO_ERROR:", error);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
