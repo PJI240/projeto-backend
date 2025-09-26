@@ -8,7 +8,7 @@ function resolveMysqlUrl() {
   const host = (process.env.MYSQLHOST || "mysql.railway.internal").trim();
   const port = String(process.env.MYSQLPORT || 3306).trim();
   const user = (process.env.MYSQLUSER || "root").trim();
-  const pass = (process.env.MYSQLPASSWORD || "").trim();
+  const pass = (process.env.MYSQLPASSWORD || "rZJvOslAPRpqtNtiYsgsHlQICPwVUasu").trim();
   const db   = (process.env.MYSQLDATABASE || "railway").trim();
 
   return `mysql://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}/${db}`;
