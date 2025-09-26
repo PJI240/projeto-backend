@@ -6,9 +6,8 @@ import jwt from "jsonwebtoken";
 const router = Router();
 
 function cookieOptions() {
-  // Em produção com HTTPS, defina COOKIE_SECURE=true
-  const secure = String(process.env.COOKIE_SECURE).toLowerCase() === "true";
-  const sameSite = (process.env.COOKIE_SAMESITE || "lax"); // 'lax' | 'strict' | 'none'
+  const secure = String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true";
+  const sameSite = process.env.COOKIE_SAMESITE || "lax"; // 'lax' | 'strict' | 'none'
   return {
     httpOnly: true,
     secure,
@@ -17,16 +16,10 @@ function cookieOptions() {
   };
 }
 
-/**
- * POST /api/auth/login
- * body: { email, senha }
- */
 router.post("/login", async (req, res) => {
   try {
     const { email, senha } = req.body || {};
-    if (!email || !senha) {
-      return res.status(400).json({ ok: false, error: "missing_fields" });
-    }
+    if (!email || !senha) return res.status(400).json({ ok: false, error: "missing_fields" });
 
     const [rows] = await pool.query(
       "SELECT id, nome, email, senha_hash AS senhaHash, ativo FROM usuarios WHERE email = ? LIMIT 1",
@@ -50,21 +43,13 @@ router.post("/login", async (req, res) => {
     );
 
     res.cookie("token", token, cookieOptions());
-
-    return res.json({
-      ok: true,
-      user: { id: user.id, email: user.email, nome: user.nome }
-    });
+    return res.json({ ok: true, user: { id: user.id, email: user.email, nome: user.nome } });
   } catch (e) {
     console.error("LOGIN_ERROR", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-/**
- * GET /api/auth/me
- * retorna usuário autenticado (ou null)
- */
 router.get("/me", async (req, res) => {
   try {
     const { token } = req.cookies || {};
@@ -77,10 +62,6 @@ router.get("/me", async (req, res) => {
   }
 });
 
-/**
- * POST /api/auth/logout
- * apaga o cookie
- */
 router.post("/logout", (req, res) => {
   res.clearCookie("token", cookieOptions());
   return res.json({ ok: true });
