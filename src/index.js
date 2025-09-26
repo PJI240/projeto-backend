@@ -4,6 +4,8 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import authRoutes from "./routes/auth.js";
+import dashboardRoutes from "./routes/dashboard.js";
+
 
 
 const CONFIG = {
@@ -26,6 +28,8 @@ app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
+app.use("/api/dashboard", dashboardRoutes);
+
 
 // CORS simplificado
 app.use(cors({
@@ -42,7 +46,6 @@ const authLimiter = rateLimit({
 
 app.use("/api/auth", authLimiter, authRoutes);
 
-// Healthcheck
 app.get("/health", (_, res) => {
   res.json({ 
     ok: true,
