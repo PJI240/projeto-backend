@@ -40,6 +40,60 @@ function cookieOptions() {
   };
 }
 
+// ROTA DE REGISTRO - AJUSTADA
+router.post("/register", async (req, res) => {
+  try {
+    let { nome, email, senha } = req.body || {};
+    
+    if (!nome || !email || !senha) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
+
+    // Normaliza entrada
+    nome = String(nome).trim();
+    email = String(email).trim().toLowerCase();
+    senha = String(senha);
+
+    // Verifica se email já existe
+    const [existingUsers] = await pool.query(
+      `SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`,
+      [email]
+    );
+
+    if (existingUsers.length > 0) {
+      return res.status(409).json({ ok: false, error: "email_already_exists" });
+    }
+
+    // Hash da senha
+    const hashedPassword = await bcrypt.hash(senha, 12);
+
+    // Insere novo usuário (ativo = TRUE por padrão)
+    const [result] = await pool.query(
+      `INSERT INTO usuarios (nome, email, senha) 
+       VALUES (?, ?, ?)`,
+      [nome, email, hashedPassword]
+    );
+
+    // Gera token JWT
+    const token = jwt.sign(
+      { sub: result.insertId, email: email, nome: nome },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES || "1d" }
+    );
+
+    res.cookie("token", token, cookieOptions());
+    
+    return res.json({
+      ok: true,
+      user: { id: result.insertId, email: email, nome: nome },
+    });
+  } catch (e) {
+    console.error("REGISTER_ERROR", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// ROTA DE LOGIN - AJUSTADA para BOOLEAN
 router.post("/login", async (req, res) => {
   try {
     let { email, senha } = req.body || {};
@@ -60,7 +114,9 @@ router.post("/login", async (req, res) => {
     );
 
     const user = rows?.[0];
-    if (!user || user.ativo !== 1) {
+    
+    // AJUSTE: Verifica se usuário existe E ativo é TRUE (1 em MySQL BOOLEAN)
+    if (!user || user.ativo !== true) {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
@@ -72,7 +128,7 @@ router.post("/login", async (req, res) => {
     if (seemsBcrypt) {
       passwordOK = await bcrypt.compare(senha, stored);
     } else {
-      passwordOK = senha === stored; // ⚠️ temporário – ideal migrar para hash
+      passwordOK = senha === stored; 
     }
 
     if (!passwordOK) {
@@ -96,6 +152,7 @@ router.post("/login", async (req, res) => {
   }
 });
 
+// ROTAS ORIGINAIS (mantidas)
 router.get("/me", (req, res) => {
   try {
     const { token } = req.cookies || {};
