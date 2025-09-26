@@ -6,51 +6,60 @@ import jwt from "jsonwebtoken";
 const router = Router();
 
 /**
- * Em produção (Railway, HTTPS, domínios diferentes), força:
- *  - secure: true
- *  - sameSite: "none"
- * Em dev/local, usa lidas do .env ou cai no padrão lax/secure:false.
+ * Opções de cookie:
+ * - Em produção (Railway, HTTPS, domínios diferentes): secure + SameSite=none
+ * - Em dev/local: lax + secure=false
+ * - Permite override por env: COOKIE_SECURE, COOKIE_SAMESITE
  */
 function cookieOptions() {
-  const isProd = String(process.env.NODE_ENV).toLowerCase() === "production";
+  const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
-  // valores do .env (se quiser forçar manualmente)
+  // valores opcionais vindos do ambiente
   const envSecure = String(process.env.COOKIE_SECURE || "").toLowerCase();
   const envSameSite = (process.env.COOKIE_SAMESITE || "").toLowerCase();
 
-  // default locais (dev)
+  // defaults
   let secure = false;
   let sameSite = "lax";
 
   if (isProd) {
-    // produção: Railway (HTTPS) + front em outro domínio -> precisa 'secure + none'
     secure = true;
     sameSite = "none";
   }
 
-  // permitir override por env se quiser (opcional)
+  // overrides por env (opcionais)
   if (envSecure === "true") secure = true;
   if (envSecure === "false") secure = false;
   if (["lax", "strict", "none"].includes(envSameSite)) sameSite = envSameSite;
+
+  // navegadores exigem secure quando SameSite=none
+  if (sameSite === "none" && !secure) secure = true;
 
   return {
     httpOnly: true,
     secure,
     sameSite,
-    path: "/",                 // garante que vale para todo o site
-    maxAge: 24 * 60 * 60 * 1000
+    path: "/",
+    maxAge: 24 * 60 * 60 * 1000, // 1 dia
   };
 }
 
 router.post("/login", async (req, res) => {
   try {
-    const { email, senha } = req.body || {};
+    let { email, senha } = req.body || {};
     if (!email || !senha) {
       return res.status(400).json({ ok: false, error: "missing_fields" });
     }
 
+    // normaliza entrada
+    email = String(email).trim().toLowerCase();
+    senha = String(senha);
+
     const [rows] = await pool.query(
-      "SELECT id, nome, email, senha_hash AS senhaHash, ativo FROM usuarios WHERE email = ? LIMIT 1",
+      `SELECT id, nome, email, senha_hash AS senhaHash, ativo
+         FROM usuarios
+        WHERE LOWER(email) = ? 
+        LIMIT 1`,
       [email]
     );
 
@@ -59,7 +68,7 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
-    const ok = await bcrypt.compare(String(senha), String(user.senhaHash || ""));
+    const ok = await bcrypt.compare(senha, String(user.senhaHash || ""));
     if (!ok) {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
@@ -71,14 +80,17 @@ router.post("/login", async (req, res) => {
     );
 
     res.cookie("token", token, cookieOptions());
-    return res.json({ ok: true, user: { id: user.id, email: user.email, nome: user.nome } });
+    return res.json({
+      ok: true,
+      user: { id: user.id, email: user.email, nome: user.nome },
+    });
   } catch (e) {
     console.error("LOGIN_ERROR", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-router.get("/me", async (req, res) => {
+router.get("/me", (req, res) => {
   try {
     const { token } = req.cookies || {};
     if (!token) return res.json({ ok: true, user: null });
@@ -86,9 +98,10 @@ router.get("/me", async (req, res) => {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     return res.json({
       ok: true,
-      user: { id: payload.sub, email: payload.email, nome: payload.nome }
+      user: { id: payload.sub, email: payload.email, nome: payload.nome },
     });
-  } catch {
+  } catch (e) {
+    // token inválido/expirado → sem erro duro; apenas sem sessão
     return res.json({ ok: true, user: null });
   }
 });
