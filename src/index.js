@@ -1,12 +1,12 @@
 import express from "express";
-// REMOVA dotenv - não é necessário no Railway
+
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import authRoutes from "./routes/auth.js";
 
-// REMOVA esta linha: dotenv.config();
+
 
 const app = express();
 
