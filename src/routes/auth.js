@@ -56,7 +56,7 @@ router.post("/login", async (req, res) => {
     senha = String(senha);
 
     const [rows] = await pool.query(
-      `SELECT id, nome, email, senha_hash AS senhaHash, ativo
+      `SELECT id, nome, email, senha AS senhaHash, ativo
          FROM usuarios
         WHERE LOWER(email) = ? 
         LIMIT 1`,
