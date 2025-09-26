@@ -93,7 +93,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// ROTA DE LOGIN - AJUSTADA para BOOLEAN
+// ROTA DE LOGIN - CORRIGIDA
 router.post("/login", async (req, res) => {
   try {
     let { email, senha } = req.body || {};
@@ -115,21 +115,22 @@ router.post("/login", async (req, res) => {
 
     const user = rows?.[0];
     
-    // AJUSTE: Verifica se usuário existe E ativo é TRUE (1 em MySQL BOOLEAN)
-    if (!user || user.ativo !== true) {
+    // CORREÇÃO: Verifica se usuário existe E ativo é 1 (true no MySQL)
+    if (!user || user.ativo !== 1) {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
-    // Se senha for hash bcrypt ($2a/$2b/$2y), compara com bcrypt; senão compara texto simples (temporário)
-    const stored = String(user.senhaDb ?? "");
-    const seemsBcrypt = /^\$2[aby]\$/.test(stored);
+    // DEBUG: Adicione estes logs para ver o que está acontecendo
+    console.log('🔐 LOGIN DEBUG:');
+    console.log('User found:', !!user);
+    console.log('Email:', user?.email);
+    console.log('Ativo value:', user?.ativo);
+    console.log('Ativo type:', typeof user?.ativo);
+    console.log('Password starts with:', user?.senhaDb?.substring(0, 10));
 
-    let passwordOK = false;
-    if (seemsBcrypt) {
-      passwordOK = await bcrypt.compare(senha, stored);
-    } else {
-      passwordOK = senha === stored; 
-    }
+    // A senha está como bcrypt, então sempre usa bcrypt.compare
+    const passwordOK = await bcrypt.compare(senha, user.senhaDb);
+    console.log('Password match:', passwordOK);
 
     if (!passwordOK) {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
