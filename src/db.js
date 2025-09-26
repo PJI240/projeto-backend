@@ -1,38 +1,30 @@
 import mysql from "mysql2/promise";
 
-function getDbConfig() {
-  if (process.env.DATABASE_URL) {
-    console.log('📦 Usando DATABASE_URL para conexão externa');
-    return {
-      uri: process.env.DATABASE_URL,
-      waitForConnections: true,
-      connectionLimit: 10,
-      namedPlaceholders: true,
-    };
-  }
+console.log('🔍 Configurando conexão com banco...');
+console.log('DATABASE_URL:', process.env.DATABASE_URL ? '✅ Configurada' : '❌ Não encontrada');
 
-  console.log('🔧 Usando variáveis individuais para conexão');
-  const host = process.env.MYSQLHOST || "localhost";
-  const port = Number(process.env.MYSQLPORT || 3306);
-  const user = process.env.MYSQLUSER || "root";
-  const password = process.env.MYSQLPASSWORD || "";
-  const database = process.env.MYSQLDATABASE || "railway";
+// Conexão direta para Railway
+const pool = mysql.createPool({
+  uri: process.env.DATABASE_URL,
+  waitForConnections: true,
+  connectionLimit: 10,
+  namedPlaceholders: true,
+  connectTimeout: 10000,
+  acquireTimeout: 10000,
+  timeout: 10000,
+});
 
-  return {
-    host,
-    port,
-    user,
-    password,
-    database,
-    waitForConnections: true,
-    connectionLimit: 10,
-    namedPlaceholders: true,
-  };
-}
-
-export const pool = mysql.createPool(getDbConfig());
-
-// Teste de conexão (opcional - remove depois)
+// Teste de conexão
 pool.getConnection()
-  .then(() => console.log('✅ Conexão com MySQL estabelecida'))
-  .catch(err => console.error('❌ Erro de conexão MySQL:', err.message));
+  .then((connection) => {
+    console.log('✅ Conectado ao MySQL com sucesso!');
+    connection.release();
+  })
+  .catch((error) => {
+    console.error('❌ Erro de conexão MySQL:');
+    console.error('Mensagem:', error.message);
+    console.error('Código:', error.code);
+    console.error('Endereço:', error.address, 'Porta:', error.port);
+  });
+
+export { pool };
