@@ -1,24 +1,24 @@
+// src/routes/dashboard.js
 import { Router } from "express";
-import db from "../db.js"; // importa a conexão MySQL
+import { pool } from "../db.js"; 
 
 const router = Router();
 
 /**
  * GET /api/dashboard/resumo
- * Retorna contagem básica do sistema
+ * Totais básicos do sistema (campos reais do seu schema)
  */
-router.get("/resumo", async (req, res) => {
+router.get("/resumo", async (_req, res) => {
   try {
-    // executa em paralelo para mais performance
-    const [usuariosRes, pessoasRes, empresasRes] = await Promise.all([
-      db.query("SELECT COUNT(*) AS total FROM usuarios WHERE ativo = TRUE"),
-      db.query("SELECT COUNT(*) AS total FROM pessoas"),
-      db.query("SELECT COUNT(*) AS total FROM empresas WHERE ativa = TRUE"),
+    const [usuariosP, pessoasP, empresasP] = await Promise.all([
+      pool.query("SELECT COUNT(*) AS total FROM usuarios WHERE ativo = TRUE"),
+      pool.query("SELECT COUNT(*) AS total FROM pessoas"),
+      pool.query("SELECT COUNT(*) AS total FROM empresas WHERE ativa = TRUE"),
     ]);
 
-    const usuarios = usuariosRes[0][0].total;
-    const pessoas = pessoasRes[0][0].total;
-    const empresas = empresasRes[0][0].total;
+    const usuarios = usuariosP[0][0]?.total ?? 0;
+    const pessoas  = pessoasP[0][0]?.total ?? 0;
+    const empresas = empresasP[0][0]?.total ?? 0;
 
     res.json({
       ok: true,
@@ -26,8 +26,8 @@ router.get("/resumo", async (req, res) => {
       generated_at: new Date().toISOString(),
     });
   } catch (err) {
-    console.error("Erro ao obter resumo:", err);
-    res.status(500).json({ ok: false, error: "Erro interno do servidor" });
+    console.error("DASHBOARD_RESUMO_ERROR", err);
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
