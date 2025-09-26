@@ -1,24 +1,17 @@
 import mysql from "mysql2/promise";
+const host = process.env.DB_HOST || process.env.MYSQLHOST || "localhost";
+const port = Number(process.env.DB_PORT || process.env.MYSQLPORT || 3306);
+const user = process.env.DB_USER || process.env.MYSQLUSER || "root";
+const password = process.env.DB_PASSWORD || process.env.MYSQLPASSWORD || "";
+const database = process.env.DB_NAME || process.env.MYSQLDATABASE || "railway";
 
-console.log('🔍 Variáveis disponíveis:');
-console.log('- MYSQL_URL:', process.env.MYSQL_URL ? '✅' : '❌');
-console.log('- DATABASE_URL:', process.env.DATABASE_URL ? '✅' : '❌');
-
-// Use MYSQL_URL (fornecida automaticamente pelo Railway)
-const connectionString = process.env.MYSQL_URL || process.env.DATABASE_URL;
-
-if (!connectionString) {
-  console.error('❌ Nenhuma URL de banco encontrada!');
-  process.exit(1);
-}
-
-const pool = mysql.createPool({
-  uri: connectionString,
+export const pool = mysql.createPool({
+  host,
+  port,
+  user,
+  password,
+  database,
   waitForConnections: true,
   connectionLimit: 10,
-  connectTimeout: 30000
+  namedPlaceholders: true,
 });
-
-console.log('✅ Pool de conexão criado');
-
-export { pool };
