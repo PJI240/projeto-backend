@@ -1,9 +1,10 @@
 // routes/register.js
-import express from "express";
-import bcrypt from "bcrypt";
-import pool from "../db.js";
+import { Router } from "express";
+import { pool } from "../db.js";
+import jwt from "jsonwebtoken";
 
-const router = express.Router();
+const router = Router();
+
 
 const onlyDigits = (s = "") => s.replace(/\D+/g, "");
 
