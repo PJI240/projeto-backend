@@ -1,15 +1,25 @@
-// routes/empresas.js
+// src/routes/empresas.js
 import express from "express";
-import axios from "axios";
 
 const router = express.Router();
 const onlyDigits = (s = "") => (s || "").replace(/\D+/g, "");
 
-// POST /api/empresas/consulta-cnpj
+// helper: fetch com timeout
+async function fetchJson(url, { timeoutMs = 12000 } = {}) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ac.signal });
+    const data = await r.json().catch(() => null);
+    return { ok: r.ok, status: r.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 router.post("/consulta-cnpj", async (req, res) => {
   try {
-    const { cnpj } = req.body || {};
-    const num = onlyDigits(cnpj);
+    const num = onlyDigits(req.body?.cnpj);
     if (num.length !== 14) {
       return res.status(400).json({ ok: false, error: "CNPJ inválido (14 dígitos)." });
     }
@@ -17,41 +27,41 @@ router.post("/consulta-cnpj", async (req, res) => {
       return res.status(400).json({ ok: false, error: "CNPJ reservado ao sistema (GLOBAL)." });
     }
 
-    // consulta API ReceitaWS (ou espelho)
-    const url = `https://www.receitaws.com.br/v1/cnpj/${num}`;
-    const r = await axios.get(url, { timeout: 15000 });
+    const { ok, status, data } = await fetchJson(`https://www.receitaws.com.br/v1/cnpj/${num}`);
 
-    if (!r.data || r.data.status !== "OK") {
-      return res.status(400).json({ ok: false, error: "Não foi possível consultar a Receita." });
+    if (!ok || !data || data.status !== "OK") {
+      return res.status(502).json({
+        ok: false,
+        error: "Falha ao consultar a Receita (tente novamente em instantes).",
+        upstream: status,
+      });
     }
 
-    // mapear campos para o formato da tabela empresas
-    const emp = r.data;
+    const d = data;
     const empresa = {
-      razao_social: emp.nome || "",
-      nome_fantasia: emp.fantasia || "",
+      razao_social: d.nome || "",
+      nome_fantasia: d.fantasia || "",
       cnpj: num,
       inscricao_estadual: null,
-      data_abertura: emp.abertura
-        ? emp.abertura.split("/").reverse().join("-")
-        : null,
-      telefone: emp.telefone || "",
-      email: emp.email || "",
-      capital_social: parseFloat(
-        (emp.capital_social || "0").replace(/[^\d,.-]/g, "").replace(",", ".")
-      ) || null,
-      natureza_juridica: emp.natureza_juridica || "",
-      situacao_cadastral: emp.situacao || "",
-      data_situacao: emp.data_situicao
-        ? emp.data_situicao.split("/").reverse().join("-")
-        : null,
-      socios_receita: JSON.stringify(emp.qsa || []),
+      data_abertura: d.abertura ? d.abertura.split("/").reverse().join("-") : null,
+      telefone: d.telefone || "",
+      email: d.email || "",
+      capital_social: (() => {
+        const raw = String(d.capital_social ?? "").replace(/[^\d,.-]/g, "").replace(",", ".");
+        const val = parseFloat(raw);
+        return Number.isFinite(val) ? val : null;
+      })(),
+      natureza_juridica: d.natureza_juridica || "",
+      situacao_cadastral: d.situacao || "",
+      data_situacao: d.data_situicao ? d.data_situicao.split("/").reverse().join("-") : null,
+      socios_receita: JSON.stringify(d.qsa || []),
     };
 
-    res.json({ ok: true, empresa });
+    return res.json({ ok: true, empresa });
   } catch (e) {
-    console.error("CNPJ_API_ERR", e.message);
-    res.status(500).json({ ok: false, error: "Erro ao consultar CNPJ." });
+    console.error("CNPJ_API_ERR", e?.message);
+    const msg = /abort/i.test(String(e?.message || "")) ? "Tempo de consulta esgotado." : "Erro interno na consulta de CNPJ.";
+    return res.status(500).json({ ok: false, error: msg });
   }
 });
 
