@@ -5,6 +5,7 @@ import rateLimit from "express-rate-limit";
 import cors from "cors";
 import authRoutes from "./routes/auth.js";
 import dashboardRoutes from "./routes/dashboard.js";
+import registerRoutes from "./routes/register.js";
 
 const CONFIG = {
   JWT_SECRET: "JWTprojetoINTEGRADOR2025",
@@ -33,6 +34,7 @@ app.use(cors({
   origin: true, // Aceita todas temporariamente
   credentials: true
 }));
+app.use(express.json({ limit: "1mb" }));
 
 // Rate limit
 const authLimiter = rateLimit({
@@ -43,7 +45,8 @@ const authLimiter = rateLimit({
 
 // Rotas - ORDEM IMPORTANTE!
 app.use("/api/auth", authLimiter, authRoutes);
-app.use("/api/dashboard", dashboardRoutes); // Dashboard após auth
+app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/registro", registerRoutes);
 
 // Healthcheck
 app.get("/health", (_, res) => {
