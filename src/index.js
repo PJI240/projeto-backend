@@ -14,7 +14,7 @@ import empresasRoutes from "./routes/empresas.js";
  *  ========================================= */
 const CONFIG = {
   JWT_SECRET: process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
-  DATABASE_URL: process.env.DATABASE_URL || "mysql://root:***@yamanbiko.proxy.rlwy.net:17978/railway",
+  DATABASE_URL: process.env.DATABASE_URL || "mysql://root:rZJv0sIAPRpqtNtlYsgsiHQICPwVUasu@yamanbiko.proxy.rlwy.net:17978/railway",
   FRONTEND_ORIGINS:
     process.env.FRONTEND_ORIGINS ||
     "http://localhost:5173,https://projeto-frontend-gamma.vercel.app",
