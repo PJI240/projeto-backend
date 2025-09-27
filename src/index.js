@@ -6,6 +6,7 @@ import cors from "cors";
 import authRoutes from "./routes/auth.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import registerRoutes from "./routes/register.js";
+import empresasRoutes from "./routes/empresas.js";
 
 const CONFIG = {
   JWT_SECRET: "JWTprojetoINTEGRADOR2025",
@@ -47,6 +48,7 @@ const authLimiter = rateLimit({
 app.use("/api/auth", authLimiter, authRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/registro", registerRoutes);
+app.use("/api/empresas", empresasRoutes);
 
 // Healthcheck
 app.get("/health", (_, res) => {
