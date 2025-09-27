@@ -1,18 +1,18 @@
 // routes/register.js
 import { Router } from "express";
 import { pool } from "../db.js";
-import jwt from "jsonwebtoken";
+import jwt from "jsonwebtoken"; // mantido, caso use depois
+import bcrypt from "bcrypt";
 
 const router = Router();
 
-
+/* ===================== Helpers genéricos ===================== */
 const onlyDigits = (s = "") => s.replace(/\D+/g, "");
 
 function isValidCNPJ(cnpj) {
   const d = onlyDigits(cnpj);
   if (d.length !== 14) return false;
   if (/^(\d)\1{13}$/.test(d)) return false;
-  // dígitos verificadores
   const calc = (slice) => {
     let pos = slice.length - 7, sum = 0;
     for (let i = slice.length; i >= 1; i--) {
@@ -28,40 +28,81 @@ function isValidCNPJ(cnpj) {
   return d === (n + String(dv1) + String(dv2));
 }
 
+/** Converte string de data para 'YYYY-MM-DD' ou NULL.
+ *  Aceita 'YYYY-MM-DD', 'DD/MM/YYYY' e valores vazios (→ NULL).
+ */
+function toDateOrNull(input) {
+  if (input === null || input === undefined) return null;
+  const s = String(input).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // já está ok
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
+    const [dd, mm, yyyy] = s.split("/");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return null; // qualquer coisa inesperada a gente zera para não quebrar
+}
+
+/** Converte valores (ex. "8.000,00") para número decimal ou NULL */
+function toDecimalOrNull(input) {
+  if (input === null || input === undefined) return null;
+  const raw = String(input).replace(/[^\d,.-]/g, "").replace(",", ".");
+  const n = parseFloat(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Garante JSON válido em string (para coluna JSON do MySQL) */
+function toJsonString(value) {
+  if (value === null || value === undefined) return "[]";
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return "[]";
+    if (s.startsWith("[") || s.startsWith("{")) {
+      // já parece JSON – tenta validar
+      try { JSON.parse(s); return s; } catch { return "[]"; }
+    }
+    // se for string comum, tenta parsear; se não, vira []
+    try { const parsed = JSON.parse(s); return JSON.stringify(parsed ?? []); }
+    catch { return "[]"; }
+  }
+  try { return JSON.stringify(value ?? []); } catch { return "[]"; }
+}
+
+/* ===================== Helpers de registro ===================== */
 async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   const cnpjNum = onlyDigits(empresaInput.cnpj);
   if (!isValidCNPJ(cnpjNum)) throw new Error("CNPJ inválido.");
   if (cnpjNum === "00000000000000") throw new Error("CNPJ reservado (GLOBAL).");
 
-
+  // tenta achar já existente
   const [rows] = await conn.query(
     "SELECT id FROM empresas WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ? LIMIT 1",
     [cnpjNum]
   );
   if (rows.length) return rows[0].id;
 
-  // cria
-  const {
-    razao_social = "",
-    nome_fantasia = "",
-    inscricao_estadual = null,
-    data_abertura = null,       // YYYY-MM-DD
-    telefone = null,
-    email = null,
-    capital_social = null,      // DECIMAL
-    natureza_juridica = null,
-    situacao_cadastral = null,
-    data_situacao = null,       // YYYY-MM-DD
-    socios_receita = "[]",      // JSON string
-  } = empresaInput;
+  // normaliza campos para INSERT seguro em modo estrito do MySQL
+  const razao_social       = (empresaInput.razao_social || "").trim();
+  const nome_fantasia      = (empresaInput.nome_fantasia || "").trim();
+  const cnpj               = cnpjNum;
+  const inscricao_estadual = (empresaInput.inscricao_estadual || "").trim() || null;
+  const data_abertura      = toDateOrNull(empresaInput.data_abertura);
+  const telefone           = (empresaInput.telefone || "").trim() || null;
+  const email              = (empresaInput.email || "").trim() || null;
+  const capital_social     = toDecimalOrNull(empresaInput.capital_social);
+  const natureza_juridica  = (empresaInput.natureza_juridica || "").trim() || null;
+  const situacao_cadastral = (empresaInput.situacao_cadastral || empresaInput.situicao || "").trim() || null;
+  const data_situacao      = toDateOrNull(empresaInput.data_situicao);
+  const socios_receita     = toJsonString(empresaInput.socios_receita);
 
   const [ins] = await conn.query(
     `INSERT INTO empresas
-     (razao_social, nome_fantasia, cnpj, inscricao_estadual, data_abertura, telefone, email,
-      capital_social, natureza_juridica, situacao_cadastral, data_situacao, socios_receita, ativa)
+      (razao_social, nome_fantasia, cnpj, inscricao_estadual, data_abertura,
+       telefone, email, capital_social, natureza_juridica, situacao_cadastral,
+       data_situacao, socios_receita, ativa)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)`,
     [
-      razao_social, nome_fantasia, cnpjNum, inscricao_estadual, data_abertura,
+      razao_social, nome_fantasia, cnpj, inscricao_estadual, data_abertura,
       telefone, email, capital_social, natureza_juridica, situacao_cadastral,
       data_situacao, socios_receita
     ]
@@ -81,7 +122,13 @@ async function createPessoa(conn, empresaId, pessoaInput) {
   const [ins] = await conn.query(
     `INSERT INTO pessoas (nome, cpf, data_nascimento, telefone, email)
      VALUES (?,?,?,?,?)`,
-    [nome, cpfNum || null, data_nascimento || null, telefone, email]
+    [
+      nome,
+      cpfNum || null,
+      toDateOrNull(data_nascimento), // normaliza data de nascimento
+      (telefone || "").trim() || null,
+      (email || "").trim() || null
+    ]
   );
   return ins.insertId;
 }
@@ -99,7 +146,6 @@ async function createUsuario(conn, usuarioInput, pessoaNome) {
 }
 
 async function getOrCreatePerfilAdministrador(conn, empresaId) {
-  // garante perfil 'administrador' nessa empresa
   const [p] = await conn.query(
     "SELECT id FROM perfis WHERE empresa_id = ? AND nome = 'administrador' LIMIT 1",
     [empresaId]
@@ -121,7 +167,6 @@ async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
      VALUES (?,?,?)`,
     [empresaId, usuarioId, perfilId]
   );
-  // opcional: vincular também em empresas_usuarios
   await conn.query(
     `INSERT IGNORE INTO empresas_usuarios (empresa_id, usuario_id, perfil_principal, ativo)
      VALUES (?,?,?,1)`,
@@ -129,7 +174,7 @@ async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   );
 }
 
-// ===== Rotas =====
+/* ===================== Rotas ===================== */
 
 /**
  * POST /api/registro/completo
@@ -163,7 +208,7 @@ router.post("/completo", async (req, res) => {
     if (conn) await conn.rollback();
     console.error("REGISTER_COMPLETO_ERR", e);
     const msg = String(e?.message || "");
-    const friendly = /reservado|inválido|Duplicate entry/i.test(msg)
+    const friendly = /reservado|inválido|Duplicate entry|CNPJ inválido/i.test(msg)
       ? msg
       : "Não foi possível concluir o cadastro.";
     return res.status(400).json({ ok: false, error: friendly });
@@ -199,7 +244,7 @@ router.post("/vincular-admin", async (req, res) => {
     if (conn) await conn.rollback();
     console.error("REGISTER_VINCULAR_ERR", e);
     const msg = String(e?.message || "");
-    const friendly = /reservado|inválido|Duplicate entry/i.test(msg)
+    const friendly = /reservado|inválido|Duplicate entry|CNPJ inválido/i.test(msg)
       ? msg
       : "Não foi possível vincular a empresa ao usuário.";
     return res.status(400).json({ ok: false, error: friendly });
