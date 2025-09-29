@@ -11,11 +11,9 @@ import registerRoutes from "./routes/register.js";
 import empresasRoutes from "./routes/empresas.js";
 import pessoasRoutes from "./routes/pessoas.js";
 import cargosRoutes from "./routes/cargos.js";
+import funcionariosRoutes from "./routes/funcionarios.js";
 
 
-/** =========================================
- *  CONFIG (mantida / com defaults)
- *  ========================================= */
 const CONFIG = {
   JWT_SECRET:
     process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
@@ -114,6 +112,7 @@ app.use("/api/registro", registerRoutes);
 app.use("/api/empresas", empresasRoutes);
 app.use("/api/pessoas", pessoasRoutes); 
 app.use("/api/cargos", cargosRoutes);
+app.use("/api/funcionarios", funcionariosRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
