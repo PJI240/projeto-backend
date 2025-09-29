@@ -238,15 +238,7 @@ router.post("/", requireAuth, async (req, res) => {
   }
 });
 
-/* ========== PUT /api/usuarios/:id (editar) ========== */
-/**
- * Pode alterar: nome, email, senha (opcional), perfil_id, ativo.
- * Não altera pessoa (mantém 1:1).
- * Regras:
- *  - usuário precisa pertencer à empresa corrente
- *  - perfil_id deve pertencer à empresa e respeitar permissão para “administrador”
- *  - email único
- */
+// ========== PUT /api/usuarios/:id ==========
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -254,14 +246,7 @@ router.put("/:id", requireAuth, async (req, res) => {
     const myRoles = await getUserRoles(req.userId);
     const id = Number(req.params.id);
 
-    let {
-      nome,
-      email,
-      senha,
-      perfil_id,
-      ativo = 1,
-    } = req.body || {};
-
+    let { nome, email, senha, perfil_id, ativo = 1 } = req.body || {};
     nome = normalize(nome);
     email = normalize(email).toLowerCase();
     perfil_id = Number(perfil_id);
@@ -270,7 +255,7 @@ router.put("/:id", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // garante que o usuário está vinculado a esta empresa
+    // garante vínculo
     const [[uOk]] = await conn.query(
       `SELECT u.id, u.email, u.nome
          FROM empresas_usuarios eu
@@ -281,27 +266,39 @@ router.put("/:id", requireAuth, async (req, res) => {
     );
     if (!uOk) throw new Error("Usuário não pertence à empresa selecionada.");
 
-    // valida email único se alterou
+    // e-mail único se mudou
     if (email && email !== String(uOk.email).toLowerCase()) {
-      const [[eDup]] = await conn.query(
+      const [[dup]] = await conn.query(
         `SELECT id FROM usuarios WHERE LOWER(email) = ? AND id <> ? LIMIT 1`,
         [email, id]
       );
-      if (eDup) throw new Error("E-mail já utilizado por outro usuário.");
+      if (dup) throw new Error("E-mail já utilizado por outro usuário.");
     }
 
-    // valida perfil
+    // perfil válido?
     if (!perfil_id) throw new Error("Perfil é obrigatório.");
     const [[perfil]] = await conn.query(
       `SELECT id, nome FROM perfis WHERE id = ? AND empresa_id = ? LIMIT 1`,
       [perfil_id, empresaId]
     );
     if (!perfil) throw new Error("Perfil inválido para esta empresa.");
-    if (normalizeRoleName(perfil.nome) === "administrador" && !canAssignAdmin(myRoles)) {
-      throw new Error("Você não pode atribuir o perfil administrador.");
+    const novoPerfilAdmin = isAdminName(perfil.nome);
+    const podeAtribuirAdmin = myRoles.some(r => ["desenvolvedor","administrador"].includes(String(r).toLowerCase()));
+    if (novoPerfilAdmin && !podeAtribuirAdmin) {
+      throw new Error("Você não pode atribuir o perfil Administrador.");
     }
 
-    // atualiza usuario (nome, email, senha?, ativo)
+    // BLOQUEIO “último admin”: se usuário ATUALMENTE é admin e é o último, não pode trocar para não-admin ou desativar
+    const ehAdminAtual = await isUserAdminInCompany(empresaId, id);
+    if (ehAdminAtual) {
+      const qtdAdmins = await countAdminsInCompany(empresaId);
+      const viraraNaoAdmin = !novoPerfilAdmin || !ativo;
+      if (qtdAdmins <= 1 && viraraNaoAdmin) {
+        throw new Error("A empresa não pode ficar sem Administrador.");
+      }
+    }
+
+    // atualiza usuario
     if (senha) {
       const hash = await bcrypt.hash(senha, 12);
       await conn.query(
@@ -315,13 +312,13 @@ router.put("/:id", requireAuth, async (req, res) => {
       );
     }
 
-    // atualiza perfil principal (empresas_usuarios)
+    // atualiza perfil principal
     await conn.query(
       `UPDATE empresas_usuarios SET perfil_principal = ? WHERE empresa_id = ? AND usuario_id = ?`,
       [normalize(perfil.nome), empresaId, id]
     );
 
-    // zera e re-vincula perfil (simples e idempotente)
+    // reatribui perfil
     await conn.query(
       `DELETE FROM usuarios_perfis WHERE empresa_id = ? AND usuario_id = ?`,
       [empresaId, id]
@@ -342,43 +339,37 @@ router.put("/:id", requireAuth, async (req, res) => {
   }
 });
 
-/* ========== DELETE /api/usuários/:id (remover da empresa / excluir) ========== */
-/**
- * Remove o usuário da **empresa corrente**:
- *  - apaga vínculos (usuarios_perfis, usuarios_pessoas, empresas_usuarios) desta empresa
- *  - se não restar vínculo com nenhuma outra empresa, apaga o usuário
- */
+// ========== DELETE /api/usuarios/:id ==========
 router.delete("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
 
+    // Se este usuário é admin e é o último, bloquear
+    const ehAdmin = await isUserAdminInCompany(empresaId, id);
+    if (ehAdmin) {
+      const qtdAdmins = await countAdminsInCompany(empresaId);
+      if (qtdAdmins <= 1) {
+        return res.status(400).json({ ok: false, error: "Não é possível remover o último Administrador da empresa." });
+      }
+    }
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // garante vínculo
     const [[uOk]] = await conn.query(
       `SELECT 1 FROM empresas_usuarios WHERE empresa_id = ? AND usuario_id = ? LIMIT 1`,
       [empresaId, id]
     );
     if (!uOk) throw new Error("Usuário não pertence à empresa selecionada.");
 
-    // remove vínculos desta empresa
     await conn.query(`DELETE FROM usuarios_perfis WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
     await conn.query(`DELETE FROM usuarios_pessoas WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
     await conn.query(`DELETE FROM empresas_usuarios WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
 
-    // verifica se ainda tem vínculo com outra empresa
-    const [[still]] = await conn.query(
-      `SELECT 1 FROM empresas_usuarios WHERE usuario_id = ? LIMIT 1`,
-      [id]
-    );
-
-    if (!still) {
-      // sem vínculo restante — remove o usuário (ou poderia só desativar)
-      await conn.query(`DELETE FROM usuarios WHERE id = ?`, [id]);
-    }
+    const [[still]] = await conn.query(`SELECT 1 FROM empresas_usuarios WHERE usuario_id = ? LIMIT 1`, [id]);
+    if (!still) await conn.query(`DELETE FROM usuarios WHERE id = ?`, [id]);
 
     await conn.commit();
     return res.json({ ok: true });
@@ -390,5 +381,3 @@ router.delete("/:id", requireAuth, async (req, res) => {
     if (conn) conn.release();
   }
 });
-
-export default router;
