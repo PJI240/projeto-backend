@@ -9,6 +9,7 @@ import authRoutes from "./routes/auth.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import registerRoutes from "./routes/register.js";
 import empresasRoutes from "./routes/empresas.js";
+import pessoasRoutes from "./routes/pessoas.js";
 
 /** =========================================
  *  CONFIG (mantida / com defaults)
@@ -109,6 +110,7 @@ app.use("/api/auth", authLimiter, authRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/registro", registerRoutes);
 app.use("/api/empresas", empresasRoutes);
+app.use("/api/pessoas", pessoasRoutes); 
 
 // Healthcheck
 app.get("/health", (_req, res) => {
