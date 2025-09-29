@@ -5,103 +5,94 @@ import jwt from "jsonwebtoken";
 
 const router = Router();
 
-/**
- * Opções de cookie:
- * - Produção (Railway, HTTPS, domínios diferentes): secure + SameSite=none
- * - Dev/local: lax + secure=false
- * - Override por env: COOKIE_SECURE, COOKIE_SAMESITE
- */
-function cookieOptions() {
-  const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+/* ================= helpers novas ================= */
 
-  const envSecure = String(process.env.COOKIE_SECURE || "").toLowerCase();
-  const envSameSite = (process.env.COOKIE_SAMESITE || "").toLowerCase();
-
-  let secure = false;
-  let sameSite = "lax";
-
-  if (isProd) {
-    secure = true;
-    sameSite = "none";
-  }
-
-  if (envSecure === "true") secure = true;
-  if (envSecure === "false") secure = false;
-  if (["lax", "strict", "none"].includes(envSameSite)) sameSite = envSameSite;
-
-  if (sameSite === "none" && !secure) secure = true;
-
-  return {
-    httpOnly: true,
-    secure,
-    sameSite,
-    path: "/",
-    maxAge: 24 * 60 * 60 * 1000, // 1 dia
-  };
+function normalizeRoleName(s = "") {
+  return String(s).trim().toLowerCase();
 }
 
-// ROTA DE REGISTRO - AJUSTADA
+function decideLanding(roles = []) {
+  const r = roles.map(normalizeRoleName);
+  if (r.includes("desenvolvedor")) return "/dashboard";      // super / visão total
+  if (r.includes("administrador")) return "/dashboard_adm";  // admin da(s) empresa(s)
+  if (r.includes("funcionario"))   return "/dashboard_func"; // painel do funcionário
+  return "/dashboard"; // fallback
+}
+
+async function getUserRoles(userId) {
+  const [rows] = await pool.query(
+    `
+      SELECT p.nome AS perfil_nome
+      FROM usuarios_perfis up
+      JOIN perfis p ON p.id = up.perfil_id
+      WHERE up.usuario_id = ?
+    `,
+    [userId]
+  );
+  return rows.map(r => r.perfil_nome);
+}
+
+/* =============== cookies (igual ao seu) =============== */
+function cookieOptions() {
+  const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+  const envSecure = String(process.env.COOKIE_SECURE || "").toLowerCase();
+  const envSameSite = (process.env.COOKIE_SAMESITE || "").toLowerCase();
+  let secure = false;
+  let sameSite = "lax";
+  if (isProd) { secure = true; sameSite = "none"; }
+  if (envSecure === "true") secure = true;
+  if (envSecure === "false") secure = false;
+  if (["lax","strict","none"].includes(envSameSite)) sameSite = envSameSite;
+  if (sameSite === "none" && !secure) secure = true;
+  return { httpOnly: true, secure, sameSite, path: "/", maxAge: 24*60*60*1000 };
+}
+
+/* =============== /register (igual ao seu) =============== */
 router.post("/register", async (req, res) => {
   try {
     let { nome, email, senha } = req.body || {};
-    
-    if (!nome || !email || !senha) {
-      return res.status(400).json({ ok: false, error: "missing_fields" });
-    }
-
-    // Normaliza entrada
+    if (!nome || !email || !senha) return res.status(400).json({ ok:false, error:"missing_fields" });
     nome = String(nome).trim();
     email = String(email).trim().toLowerCase();
     senha = String(senha);
 
-    // Verifica se email já existe
     const [existingUsers] = await pool.query(
-      `SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`,
-      [email]
+      `SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`, [email]
     );
-
     if (existingUsers.length > 0) {
-      return res.status(409).json({ ok: false, error: "email_already_exists" });
+      return res.status(409).json({ ok:false, error:"email_already_exists" });
     }
 
-    // Hash da senha
     const hashedPassword = await bcrypt.hash(senha, 12);
-
-    // Insere novo usuário (ativo = TRUE por padrão)
     const [result] = await pool.query(
-      `INSERT INTO usuarios (nome, email, senha) 
-       VALUES (?, ?, ?)`,
+      `INSERT INTO usuarios (nome, email, senha) VALUES (?,?,?)`,
       [nome, email, hashedPassword]
     );
 
-    // Gera token JWT
     const token = jwt.sign(
-      { sub: result.insertId, email: email, nome: nome },
+      { sub: result.insertId, email, nome },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES || "1d" }
     );
-
     res.cookie("token", token, cookieOptions());
-    
-    return res.json({
-      ok: true,
-      user: { id: result.insertId, email: email, nome: nome },
-    });
+
+    // NEW: já devolvemos roles/landing (pode não ter papel ainda)
+    const roles = await getUserRoles(result.insertId);
+    const landing = decideLanding(roles);
+
+    return res.json({ ok:true, user:{ id: result.insertId, email, nome }, roles, landing });
   } catch (e) {
     console.error("REGISTER_ERROR", e);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    return res.status(500).json({ ok:false, error:"server_error" });
   }
 });
 
-// ROTA DE LOGIN - CORRIGIDA
+/* =============== /login (ajustado: roles + landing) =============== */
 router.post("/login", async (req, res) => {
   try {
     let { email, senha } = req.body || {};
-    if (!email || !senha) {
-      return res.status(400).json({ ok: false, error: "missing_fields" });
-    }
+    if (!email || !senha) return res.status(400).json({ ok:false, error:"missing_fields" });
 
-    // normaliza entrada
     email = String(email).trim().toLowerCase();
     senha = String(senha);
 
@@ -112,28 +103,15 @@ router.post("/login", async (req, res) => {
         LIMIT 1`,
       [email]
     );
-
     const user = rows?.[0];
-    
-    // CORREÇÃO: Verifica se usuário existe E ativo é 1 (true no MySQL)
+
     if (!user || user.ativo !== 1) {
-      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+      return res.status(401).json({ ok:false, error:"invalid_credentials" });
     }
 
-    // DEBUG: Adicione estes logs para ver o que está acontecendo
-    console.log('🔐 LOGIN DEBUG:');
-    console.log('User found:', !!user);
-    console.log('Email:', user?.email);
-    console.log('Ativo value:', user?.ativo);
-    console.log('Ativo type:', typeof user?.ativo);
-    console.log('Password starts with:', user?.senhaDb?.substring(0, 10));
-
-    // A senha está como bcrypt, então sempre usa bcrypt.compare
     const passwordOK = await bcrypt.compare(senha, user.senhaDb);
-    console.log('Password match:', passwordOK);
-
     if (!passwordOK) {
-      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+      return res.status(401).json({ ok:false, error:"invalid_credentials" });
     }
 
     const token = jwt.sign(
@@ -141,34 +119,57 @@ router.post("/login", async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES || "1d" }
     );
-
     res.cookie("token", token, cookieOptions());
+
+    // NEW: pega papéis e calcula landing
+    const roles = await getUserRoles(user.id);
+    const landing = decideLanding(roles);
+
     return res.json({
       ok: true,
       user: { id: user.id, email: user.email, nome: user.nome },
+      roles,
+      landing
     });
   } catch (e) {
     console.error("LOGIN_ERROR", e);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    return res.status(500).json({ ok:false, error:"server_error" });
   }
 });
 
-// ROTAS ORIGINAIS (mantidas)
-router.get("/me", (req, res) => {
+/* =============== /me (ajustado: roles + landing) =============== */
+router.get("/me", async (req, res) => {
   try {
     const { token } = req.cookies || {};
     if (!token) return res.json({ ok: true, user: null });
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
+
+    // garante que usuário ainda existe e está ativo
+    const [[u]] = await pool.query(
+      `SELECT id, nome, email, ativo FROM usuarios WHERE id = ? LIMIT 1`,
+      [payload.sub]
+    );
+    if (!u || u.ativo !== 1) {
+      return res.json({ ok: true, user: null });
+    }
+
+    // NEW: papéis + landing
+    const roles = await getUserRoles(u.id);
+    const landing = decideLanding(roles);
+
     return res.json({
       ok: true,
-      user: { id: payload.sub, email: payload.email, nome: payload.nome },
+      user: { id: u.id, email: u.email, nome: u.nome },
+      roles,
+      landing
     });
   } catch (_e) {
     return res.json({ ok: true, user: null });
   }
 });
 
+/* =============== /logout (igual) =============== */
 router.post("/logout", (req, res) => {
   res.clearCookie("token", cookieOptions());
   return res.json({ ok: true });
