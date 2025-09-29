@@ -10,6 +10,8 @@ import dashboardRoutes from "./routes/dashboard.js";
 import registerRoutes from "./routes/register.js";
 import empresasRoutes from "./routes/empresas.js";
 import pessoasRoutes from "./routes/pessoas.js";
+import cargosRoutes from "./routes/cargos.js";
+
 
 /** =========================================
  *  CONFIG (mantida / com defaults)
@@ -111,6 +113,7 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/registro", registerRoutes);
 app.use("/api/empresas", empresasRoutes);
 app.use("/api/pessoas", pessoasRoutes); 
+app.use("/api/cargos", cargosRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
