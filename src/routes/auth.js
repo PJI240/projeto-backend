@@ -1,3 +1,4 @@
+// routes/auth.js
 import { Router } from "express";
 import { pool } from "../db.js";
 import bcrypt from "bcrypt";
@@ -5,7 +6,7 @@ import jwt from "jsonwebtoken";
 
 const router = Router();
 
-/* ================= helpers novas ================= */
+/* ===================== Helpers de RBAC ===================== */
 
 function normalizeRoleName(s = "") {
   return String(s).trim().toLowerCase();
@@ -13,7 +14,7 @@ function normalizeRoleName(s = "") {
 
 function decideLanding(roles = []) {
   const r = roles.map(normalizeRoleName);
-  if (r.includes("desenvolvedor")) return "/dashboard";      // super / visão total
+  if (r.includes("desenvolvedor")) return "/dashboard";      // visão total
   if (r.includes("administrador")) return "/dashboard_adm";  // admin da(s) empresa(s)
   if (r.includes("funcionario"))   return "/dashboard_func"; // painel do funcionário
   return "/dashboard"; // fallback
@@ -29,38 +30,77 @@ async function getUserRoles(userId) {
     `,
     [userId]
   );
-  return rows.map(r => r.perfil_nome);
+  return rows.map((r) => r.perfil_nome);
 }
 
-/* =============== cookies (igual ao seu) =============== */
-function cookieOptions() {
+/* ===================== Cookies (set/clear) ===================== */
+/**
+ * Importante: Express 5 deprecou passar `maxAge` em `res.clearCookie`.
+ * Mantemos as opções em funções separadas:
+ * - cookieSetOptions(): usar em res.cookie (inclui maxAge)
+ * - cookieClearOptions(): usar em res.clearCookie (sem maxAge)
+ */
+
+function cookieOptionsBase() {
   const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
   const envSecure = String(process.env.COOKIE_SECURE || "").toLowerCase();
   const envSameSite = (process.env.COOKIE_SAMESITE || "").toLowerCase();
+
   let secure = false;
   let sameSite = "lax";
-  if (isProd) { secure = true; sameSite = "none"; }
+
+  if (isProd) {
+    secure = true;
+    sameSite = "none";
+  }
   if (envSecure === "true") secure = true;
   if (envSecure === "false") secure = false;
-  if (["lax","strict","none"].includes(envSameSite)) sameSite = envSameSite;
+  if (["lax", "strict", "none"].includes(envSameSite)) sameSite = envSameSite;
+
+  // SameSite=None exige Secure=true
   if (sameSite === "none" && !secure) secure = true;
-  return { httpOnly: true, secure, sameSite, path: "/", maxAge: 24*60*60*1000 };
+
+  return {
+    httpOnly: true,
+    secure,
+    sameSite,
+    path: "/",
+  };
 }
 
-/* =============== /register (igual ao seu) =============== */
+function cookieSetOptions() {
+  return {
+    ...cookieOptionsBase(),
+    maxAge: 24 * 60 * 60 * 1000, // 1 dia
+  };
+}
+
+function cookieClearOptions() {
+  // sem maxAge (Express 5 expira automaticamente)
+  return {
+    ...cookieOptionsBase(),
+  };
+}
+
+/* ===================== /register ===================== */
+
 router.post("/register", async (req, res) => {
   try {
     let { nome, email, senha } = req.body || {};
-    if (!nome || !email || !senha) return res.status(400).json({ ok:false, error:"missing_fields" });
+    if (!nome || !email || !senha) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
+
     nome = String(nome).trim();
     email = String(email).trim().toLowerCase();
     senha = String(senha);
 
     const [existingUsers] = await pool.query(
-      `SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`, [email]
+      `SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`,
+      [email]
     );
     if (existingUsers.length > 0) {
-      return res.status(409).json({ ok:false, error:"email_already_exists" });
+      return res.status(409).json({ ok: false, error: "email_already_exists" });
     }
 
     const hashedPassword = await bcrypt.hash(senha, 12);
@@ -74,24 +114,32 @@ router.post("/register", async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES || "1d" }
     );
-    res.cookie("token", token, cookieOptions());
 
-    // NEW: já devolvemos roles/landing (pode não ter papel ainda)
+    res.cookie("token", token, cookieSetOptions());
+
     const roles = await getUserRoles(result.insertId);
     const landing = decideLanding(roles);
 
-    return res.json({ ok:true, user:{ id: result.insertId, email, nome }, roles, landing });
+    return res.json({
+      ok: true,
+      user: { id: result.insertId, email, nome },
+      roles,
+      landing,
+    });
   } catch (e) {
     console.error("REGISTER_ERROR", e);
-    return res.status(500).json({ ok:false, error:"server_error" });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-/* =============== /login (ajustado: roles + landing) =============== */
+/* ===================== /login ===================== */
+
 router.post("/login", async (req, res) => {
   try {
     let { email, senha } = req.body || {};
-    if (!email || !senha) return res.status(400).json({ ok:false, error:"missing_fields" });
+    if (!email || !senha) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
 
     email = String(email).trim().toLowerCase();
     senha = String(senha);
@@ -106,12 +154,12 @@ router.post("/login", async (req, res) => {
     const user = rows?.[0];
 
     if (!user || user.ativo !== 1) {
-      return res.status(401).json({ ok:false, error:"invalid_credentials" });
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
     const passwordOK = await bcrypt.compare(senha, user.senhaDb);
     if (!passwordOK) {
-      return res.status(401).json({ ok:false, error:"invalid_credentials" });
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
     const token = jwt.sign(
@@ -119,9 +167,9 @@ router.post("/login", async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES || "1d" }
     );
-    res.cookie("token", token, cookieOptions());
 
-    // NEW: pega papéis e calcula landing
+    res.cookie("token", token, cookieSetOptions());
+
     const roles = await getUserRoles(user.id);
     const landing = decideLanding(roles);
 
@@ -129,23 +177,28 @@ router.post("/login", async (req, res) => {
       ok: true,
       user: { id: user.id, email: user.email, nome: user.nome },
       roles,
-      landing
+      landing,
     });
   } catch (e) {
     console.error("LOGIN_ERROR", e);
-    return res.status(500).json({ ok:false, error:"server_error" });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-/* =============== /me (ajustado: roles + landing) =============== */
+/* ===================== /me ===================== */
+
 router.get("/me", async (req, res) => {
   try {
     const { token } = req.cookies || {};
     if (!token) return res.json({ ok: true, user: null });
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET);
+    } catch {
+      return res.json({ ok: true, user: null });
+    }
 
-    // garante que usuário ainda existe e está ativo
     const [[u]] = await pool.query(
       `SELECT id, nome, email, ativo FROM usuarios WHERE id = ? LIMIT 1`,
       [payload.sub]
@@ -154,7 +207,6 @@ router.get("/me", async (req, res) => {
       return res.json({ ok: true, user: null });
     }
 
-    // NEW: papéis + landing
     const roles = await getUserRoles(u.id);
     const landing = decideLanding(roles);
 
@@ -162,16 +214,18 @@ router.get("/me", async (req, res) => {
       ok: true,
       user: { id: u.id, email: u.email, nome: u.nome },
       roles,
-      landing
+      landing,
     });
   } catch (_e) {
     return res.json({ ok: true, user: null });
   }
 });
 
-/* =============== /logout (igual) =============== */
+/* ===================== /logout ===================== */
+
 router.post("/logout", (req, res) => {
-  res.clearCookie("token", cookieOptions());
+  // Express 5: não passe maxAge no clearCookie
+  res.clearCookie("token", cookieClearOptions());
   return res.json({ ok: true });
 });
 
