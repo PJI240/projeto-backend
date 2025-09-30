@@ -13,6 +13,7 @@ import pessoasRoutes from "./routes/pessoas.js";
 import cargosRoutes from "./routes/cargos.js";
 import funcionariosRoutes from "./routes/funcionarios.js";
 import usuariosRoutes from "./routes/usuarios.js";
+import perfisRoutes from "./routes/perfis.js";
 
 const CONFIG = {
   JWT_SECRET:
@@ -114,6 +115,7 @@ app.use("/api/pessoas", pessoasRoutes);
 app.use("/api/cargos", cargosRoutes);
 app.use("/api/funcionarios", funcionariosRoutes);
 app.use("/api/usuarios", usuariosRoutes);
+app.use("/api/perfis", perfisRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
