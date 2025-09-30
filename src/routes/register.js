@@ -15,16 +15,13 @@ const limit = (s, n) => (s == null ? null : String(s).slice(0, n));
 const toYYYYMMDDorNull = (s) => {
   if (!s) return null;
   const t = String(s).trim();
-  // "YYYY-MM-DD"
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
-  // "DD/MM/YYYY"
-  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t; // "YYYY-MM-DD"
+  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/); // "DD/MM/YYYY"
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   return null;
 };
 function normalizePhone(raw) {
   if (!raw) return null;
-  // pega só o primeiro número (se vier "A / B, C")
   const first = String(raw).split(/[\/,;]+/)[0];
   const digits = onlyDigits(first).slice(0, 20);
   return digits || null;
@@ -49,19 +46,24 @@ function isValidCNPJ(cnpj) {
 }
 
 /* ========= empresa ========= */
-async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
-  const cnpjNum = onlyDigits(empresaInput.cnpj);
-  if (!isValidCNPJ(cnpjNum)) throw new Error("CNPJ inválido.");
-  if (cnpjNum === "00000000000000") throw new Error("CNPJ reservado (GLOBAL).");
+async function findEmpresaByCNPJ(conn, rawCnpj) {
+  const num = onlyDigits(rawCnpj || "");
+  if (!isValidCNPJ(num)) throw new Error("CNPJ inválido.");
+  if (num === "00000000000000") throw new Error("CNPJ reservado (GLOBAL).");
 
-  // já existe?
-  const [rows] = await conn.query(
-    "SELECT id FROM empresas WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ? LIMIT 1",
-    [cnpjNum]
+  const [[row]] = await conn.query(
+    `SELECT id, razao_social
+       FROM empresas
+      WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ?
+      LIMIT 1`,
+    [num]
   );
-  if (rows.length) return rows[0].id;
+  return row || null;
+}
 
-  // normalizações e limites de tamanho conforme schema
+async function createEmpresa(conn, empresaInput) {
+  const cnpjNum = onlyDigits(empresaInput.cnpj);
+  // (validação já foi feita antes)
   const razao_social       = limit(trimOrNull(empresaInput.razao_social), 255) || "";
   const nome_fantasia      = limit(trimOrNull(empresaInput.nome_fantasia), 255);
   const inscricao_estadual = limit(trimOrNull(empresaInput.inscricao_estadual), 50);
@@ -75,7 +77,6 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   const situacao_cadastral = limit(trimOrNull(empresaInput.situacao_cadastral), 50);
   const data_situacao      = toYYYYMMDDorNull(empresaInput.data_situacao);
 
-  // JSON: aceita objeto/array ou string JSON
   let socios_receita = "[]";
   if (Array.isArray(empresaInput.socios_receita) || typeof empresaInput.socios_receita === "object") {
     try { socios_receita = JSON.stringify(empresaInput.socios_receita); } catch {}
@@ -193,7 +194,6 @@ async function getOrCreateCargoByName(conn, empresaId, nomeCargo) {
 }
 
 async function createFuncionarioIfNotExists(conn, { empresaId, pessoaId, cargoId }) {
-  // salario_base = 0.00 conforme solicitado
   await conn.query(
     `INSERT IGNORE INTO funcionarios
        (empresa_id, pessoa_id, cargo_id, regime, salario_base, valor_hora, ativo)
@@ -203,7 +203,7 @@ async function createFuncionarioIfNotExists(conn, { empresaId, pessoaId, cargoId
       pessoaId,
       cargoId,
       "MENSALISTA",
-      0.00,
+      0.00, // salário base = 0 conforme solicitado
       null
     ]
   );
@@ -220,9 +220,10 @@ async function createFuncionarioIfNotExists(conn, { empresaId, pessoaId, cargoId
 /**
  * POST /api/registro/completo
  * Body: { empresa:{...}, pessoa:{...}, usuario:{...} }
- * Cria empresa (se necessário), pessoa, usuário,
- * garante perfil 'administrador', vincula usuário→perfil/empresa,
- * vincula usuário→pessoa e cria funcionário (pessoa↔empresa) com cargo "colaborador".
+ * Regras:
+ * - Se CNPJ já existir no banco, aborta com 409 e mensagem amigável.
+ * - Caso contrário, cria empresa, pessoa, usuário; vincula perfil admin,
+ *   usuário↔empresa, usuário↔pessoa; e cria funcionário (cargo "colaborador").
  */
 router.post("/completo", async (req, res) => {
   const { empresa = {}, pessoa = {}, usuario = {} } = req.body || {};
@@ -231,15 +232,35 @@ router.post("/completo", async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    const empresaId = await getOrCreateEmpresaByCNPJ(conn, empresa);
-    const pessoaId  = await createPessoa(conn, pessoa);
-    const usuarioId = await createUsuario(conn, usuario, pessoa.nome);
-    const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
+    // 0) BLOQUEIO se o CNPJ já existir
+    const existente = await findEmpresaByCNPJ(conn, empresa?.cnpj);
+    if (existente) {
+      await conn.rollback();
+      conn.release();
+      return res.status(409).json({
+        ok: false,
+        code: "already_registered",
+        error: "Sua empresa já tem cadastro, procure o seu administrador.",
+        empresa_id: existente.id,
+        razao_social: existente.razao_social
+      });
+    }
 
+    // 1) Criar empresa
+    const empresaId = await createEmpresa(conn, empresa);
+
+    // 2) Criar pessoa
+    const pessoaId  = await createPessoa(conn, pessoa);
+
+    // 3) Criar usuário
+    const usuarioId = await createUsuario(conn, usuario, pessoa.nome);
+
+    // 4) Perfil admin e vínculos
+    const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
     await linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId);
     await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId);
 
-    // cargo padrão e funcionário
+    // 5) Cargo "colaborador" e funcionário
     const cargoId = await getOrCreateCargoByName(conn, empresaId, "colaborador");
     const funcionarioId = await createFuncionarioIfNotExists(conn, {
       empresaId,
@@ -272,13 +293,11 @@ router.post("/completo", async (req, res) => {
 /**
  * POST /api/registro/vincular-admin
  * Body: { empresa:{...} }  (usuário já autenticado via cookie)
- * Obs.: aqui não criamos usuarios_pessoas nem funcionário,
- * pois é um fluxo de “vincular nova empresa” para um usuário já existente.
+ * Obs.: não cria usuarios_pessoas nem funcionário.
  */
 router.post("/vincular-admin", async (req, res) => {
-  const uid = req.userId || null; // injete via middleware se tiver
+  const uid = req.userId || null; // injete via middleware se houver
   try {
-    // fallback simples usando JWT do cookie
     let userId = uid;
     if (!userId) {
       const { token } = req.cookies || {};
@@ -287,13 +306,25 @@ router.post("/vincular-admin", async (req, res) => {
       userId = payload.sub;
     }
 
-    const { empresa = {} } = req.body || {};
     const conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    const empresaId = await getOrCreateEmpresaByCNPJ(conn, empresa);
-    const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
+    // também bloqueia se já existir
+    const existente = await findEmpresaByCNPJ(conn, (req.body?.empresa || {}).cnpj);
+    if (existente) {
+      await conn.rollback();
+      conn.release();
+      return res.status(409).json({
+        ok: false,
+        code: "already_registered",
+        error: "Sua empresa já tem cadastro, procure o seu administrador.",
+        empresa_id: existente.id,
+        razao_social: existente.razao_social
+      });
+    }
 
+    const empresaId = await createEmpresa(conn, req.body?.empresa || {});
+    const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
     await linkUsuarioPerfil(conn, empresaId, userId, perfilId);
 
     await conn.commit();
