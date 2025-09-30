@@ -105,7 +105,7 @@ app.use("/api/funcionarios", funcionariosRoutes);
 app.use("/api/usuarios", usuariosRoutes);
 app.use("/api/perfis", perfisRoutes);
 app.use("/api/permissoes", permissoesRoutes);
-app.use("/api/perfis-permissoes", perfisPermissoesRoutes);
+app.use("/api/perfis_permissoes", perfisPermissoesRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
