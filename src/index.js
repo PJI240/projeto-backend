@@ -15,6 +15,9 @@ import usuariosRoutes from "./routes/usuarios.js";
 import perfisRoutes from "./routes/perfis.js";
 import permissoesRoutes from "./routes/permissoes.js";
 
+import perfisPermissoesRoutes from "./routes/perfis_permissoes.js";
+
+
 const CONFIG = {
   JWT_SECRET: process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
   DATABASE_URL:
@@ -103,6 +106,7 @@ app.use("/api/funcionarios", funcionariosRoutes);
 app.use("/api/usuarios", usuariosRoutes);
 app.use("/api/perfis", perfisRoutes);
 app.use("/api/permissoes", permissoesRoutes);
+app.use("/api/perfis-permissoes", perfisPermissoesRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
