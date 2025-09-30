@@ -1,11 +1,11 @@
-// src/routes/permissoes.js
 import { Router } from "express";
 import { pool } from "../db.js";
 import jwt from "jsonwebtoken";
 
 const router = Router();
 
-export const PERMISSIONS_REGISTRY = [
+/* ======= Registro canônico ======= */
+const PERMISSIONS_REGISTRY = [
   { codigo: "menu.dashboard.ver", descricao: "Ver Dashboard", escopo: "ui" },
   { codigo: "menu.usuarios.ver", descricao: "Ver Usuários", escopo: "ui" },
   { codigo: "menu.pessoas.ver", descricao: "Ver Pessoas", escopo: "ui" },
@@ -20,10 +20,9 @@ export const PERMISSIONS_REGISTRY = [
   { codigo: "pessoas.criar", descricao: "Criar pessoa", escopo: "api" },
   { codigo: "pessoas.editar", descricao: "Editar pessoa", escopo: "api" },
   { codigo: "pessoas.excluir", descricao: "Excluir pessoa", escopo: "api" },
-  // adicione aqui outras permissões conforme expandir o sistema
 ];
 
-/* ===== Helper para autenticação básica ===== */
+/* ======= Auth básico ======= */
 function requireAuth(req, res, next) {
   try {
     const { token } = req.cookies || {};
@@ -35,11 +34,47 @@ function requireAuth(req, res, next) {
   }
 }
 
-/* ===== GET /api/permissoes ===== */
+/* ======= Migração automática da tabela =======
+   - Adiciona colunas 'descricao' e 'escopo' se não existirem
+   - Garante UNIQUE(codigo)
+*/
+async function ensurePermissoesShape() {
+  // Descobre colunas atuais
+  const [cols] = await pool.query(`SHOW COLUMNS FROM permissoes`);
+  const names = new Set(cols.map(c => c.Field));
+
+  const alterParts = [];
+
+  if (!names.has("descricao")) {
+    alterParts.push(`ADD COLUMN descricao VARCHAR(255) NULL`);
+  }
+  if (!names.has("escopo")) {
+    // depois de descricao se possível (não é obrigatório)
+    alterParts.push(`ADD COLUMN escopo VARCHAR(50) NULL`);
+  }
+
+  if (alterParts.length) {
+    await pool.query(`ALTER TABLE permissoes ${alterParts.join(", ")}`);
+  }
+
+  // Garante UNIQUE em codigo
+  const [idx] = await pool.query(`SHOW INDEX FROM permissoes`);
+  const hasUniqueCodigo = idx.some(r => r.Column_name === "codigo" && r.Non_unique === 0);
+  if (!hasUniqueCodigo) {
+    // remove índice duplicado se houver e cria unique
+    // (MySQL permite múltiplos índices no mesmo campo; aqui só garantimos o UNIQUE)
+    await pool.query(`ALTER TABLE permissoes ADD UNIQUE KEY uq_permissoes_codigo (codigo)`);
+  }
+}
+
+/* ======= GET /api/permissoes ======= */
 router.get("/", requireAuth, async (_req, res) => {
   try {
+    await ensurePermissoesShape();
     const [rows] = await pool.query(
-      "SELECT id, codigo, descricao, escopo FROM permissoes ORDER BY codigo ASC"
+      `SELECT id, codigo, descricao, escopo
+         FROM permissoes
+        ORDER BY codigo ASC`
     );
     return res.json({ ok: true, permissoes: rows });
   } catch (e) {
@@ -48,25 +83,26 @@ router.get("/", requireAuth, async (_req, res) => {
   }
 });
 
-/* ===== POST /api/permissoes/sync =====
-   Faz upsert das permissões definidas em PERMISSIONS_REGISTRY.
+/* ======= POST /api/permissoes/sync =======
+   Upsert com base no registro canônico.
 */
 router.post("/sync", requireAuth, async (_req, res) => {
   let conn;
   try {
+    await ensurePermissoesShape();
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
     let upserted = 0;
-    for (const perm of PERMISSIONS_REGISTRY) {
-      const { codigo, descricao, escopo } = perm;
+    for (const { codigo, descricao, escopo } of PERMISSIONS_REGISTRY) {
       const [r] = await conn.query(
         `INSERT INTO permissoes (codigo, descricao, escopo)
-         VALUES (?,?,?)
+              VALUES (?,?,?)
          ON DUPLICATE KEY UPDATE
-           descricao = VALUES(descricao),
-           escopo = VALUES(escopo)`,
-        [codigo, descricao, escopo]
+              descricao = VALUES(descricao),
+              escopo    = VALUES(escopo)`,
+        [codigo, descricao ?? null, escopo ?? null]
       );
       upserted += r.affectedRows;
     }
