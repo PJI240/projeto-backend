@@ -14,7 +14,6 @@ import funcionariosRoutes from "./routes/funcionarios.js";
 import usuariosRoutes from "./routes/usuarios.js";
 import perfisRoutes from "./routes/perfis.js";
 import permissoesRoutes from "./routes/permissoes.js";
-
 import perfisPermissoesRoutes from "./routes/perfis_permissoes.js";
 
 
