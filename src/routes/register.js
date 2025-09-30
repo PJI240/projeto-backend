@@ -1,14 +1,34 @@
 // routes/register.js
 import { Router } from "express";
 import { pool } from "../db.js";
-import jwt from "jsonwebtoken"; // mantido, caso use depois
 import bcrypt from "bcrypt";
 
 const router = Router();
 
-/* ===================== Helpers genéricos ===================== */
-const onlyDigits = (s = "") => s.replace(/\D+/g, "");
-
+/* ========= helpers ========= */
+const onlyDigits = (s = "") => String(s).replace(/\D+/g, "");
+const trimOrNull = (s) => {
+  const v = (s ?? "").toString().trim();
+  return v ? v : null;
+};
+const limit = (s, n) => (s == null ? null : String(s).slice(0, n));
+const toYYYYMMDDorNull = (s) => {
+  if (!s) return null;
+  const t = String(s);
+  // aceita "YYYY-MM-DD" já normalizado
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+  // tenta "DD/MM/YYYY"
+  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  return null;
+};
+function normalizePhone(raw) {
+  if (!raw) return null;
+  // pega só o primeiro número (se vier "A / B, C")
+  const first = String(raw).split(/[\/,;]+/)[0];
+  const digits = onlyDigits(first).slice(0, 20);
+  return digits || null;
+}
 function isValidCNPJ(cnpj) {
   const d = onlyDigits(cnpj);
   if (d.length !== 14) return false;
@@ -28,72 +48,41 @@ function isValidCNPJ(cnpj) {
   return d === (n + String(dv1) + String(dv2));
 }
 
-/** Converte string de data para 'YYYY-MM-DD' ou NULL.
- *  Aceita 'YYYY-MM-DD', 'DD/MM/YYYY' e valores vazios (→ NULL).
- */
-function toDateOrNull(input) {
-  if (input === null || input === undefined) return null;
-  const s = String(input).trim();
-  if (!s) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // já está ok
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
-    const [dd, mm, yyyy] = s.split("/");
-    return `${yyyy}-${mm}-${dd}`;
-  }
-  return null; // qualquer coisa inesperada a gente zera para não quebrar
-}
-
-/** Converte valores (ex. "8.000,00") para número decimal ou NULL */
-function toDecimalOrNull(input) {
-  if (input === null || input === undefined) return null;
-  const raw = String(input).replace(/[^\d,.-]/g, "").replace(",", ".");
-  const n = parseFloat(raw);
-  return Number.isFinite(n) ? n : null;
-}
-
-/** Garante JSON válido em string (para coluna JSON do MySQL) */
-function toJsonString(value) {
-  if (value === null || value === undefined) return "[]";
-  if (typeof value === "string") {
-    const s = value.trim();
-    if (!s) return "[]";
-    if (s.startsWith("[") || s.startsWith("{")) {
-      // já parece JSON – tenta validar
-      try { JSON.parse(s); return s; } catch { return "[]"; }
-    }
-    // se for string comum, tenta parsear; se não, vira []
-    try { const parsed = JSON.parse(s); return JSON.stringify(parsed ?? []); }
-    catch { return "[]"; }
-  }
-  try { return JSON.stringify(value ?? []); } catch { return "[]"; }
-}
-
-/* ===================== Helpers de registro ===================== */
+/* ========= empresa ========= */
 async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   const cnpjNum = onlyDigits(empresaInput.cnpj);
   if (!isValidCNPJ(cnpjNum)) throw new Error("CNPJ inválido.");
   if (cnpjNum === "00000000000000") throw new Error("CNPJ reservado (GLOBAL).");
 
-  // tenta achar já existente
+  // já existe?
   const [rows] = await conn.query(
     "SELECT id FROM empresas WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ? LIMIT 1",
     [cnpjNum]
   );
   if (rows.length) return rows[0].id;
 
-  // normaliza campos para INSERT seguro em modo estrito do MySQL
-  const razao_social       = (empresaInput.razao_social || "").trim();
-  const nome_fantasia      = (empresaInput.nome_fantasia || "").trim();
-  const cnpj               = cnpjNum;
-  const inscricao_estadual = (empresaInput.inscricao_estadual || "").trim() || null;
-  const data_abertura      = toDateOrNull(empresaInput.data_abertura);
-  const telefone           = (empresaInput.telefone || "").trim() || null;
-  const email              = (empresaInput.email || "").trim() || null;
-  const capital_social     = toDecimalOrNull(empresaInput.capital_social);
-  const natureza_juridica  = (empresaInput.natureza_juridica || "").trim() || null;
-  const situacao_cadastral = (empresaInput.situacao_cadastral || empresaInput.situicao || "").trim() || null;
-  const data_situacao      = toDateOrNull(empresaInput.data_situicao);
-  const socios_receita     = toJsonString(empresaInput.socios_receita);
+  // normalizações e limites de tamanho conforme schema
+  const razao_social       = limit(trimOrNull(empresaInput.razao_social), 255) || "";
+  const nome_fantasia      = limit(trimOrNull(empresaInput.nome_fantasia), 255);
+  const inscricao_estadual = limit(trimOrNull(empresaInput.inscricao_estadual), 50);
+  const data_abertura      = toYYYYMMDDorNull(empresaInput.data_abertura);
+  const telefone           = normalizePhone(empresaInput.telefone);               // <= aqui o fix
+  const email              = limit(trimOrNull(empresaInput.email), 255);
+  const capital_social     = Number.isFinite(+empresaInput.capital_social)
+    ? +empresaInput.capital_social
+    : null;
+  const natureza_juridica  = limit(trimOrNull(empresaInput.natureza_juridica), 100);
+  const situacao_cadastral = limit(trimOrNull(empresaInput.situacao_cadastral), 50);
+  const data_situacao      = toYYYYMMDDorNull(empresaInput.data_situacao);
+
+  // JSON: aceita objeto/array ou string JSON
+  let socios_receita = "[]";
+  if (Array.isArray(empresaInput.socios_receita) || typeof empresaInput.socios_receita === "object") {
+    try { socios_receita = JSON.stringify(empresaInput.socios_receita); } catch {}
+  } else if (typeof empresaInput.socios_receita === "string") {
+    // se já for JSON válido, usa; senão, "[]"
+    try { JSON.parse(empresaInput.socios_receita); socios_receita = empresaInput.socios_receita; } catch {}
+  }
 
   const [ins] = await conn.query(
     `INSERT INTO empresas
@@ -102,15 +91,25 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
        data_situacao, socios_receita, ativa)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)`,
     [
-      razao_social, nome_fantasia, cnpj, inscricao_estadual, data_abertura,
-      telefone, email, capital_social, natureza_juridica, situacao_cadastral,
-      data_situacao, socios_receita
+      razao_social,
+      nome_fantasia,
+      cnpjNum,
+      inscricao_estadual,
+      data_abertura,
+      telefone,                // agora sempre <= 20 ou null
+      email,
+      capital_social,
+      natureza_juridica,
+      situacao_cadastral,
+      data_situacao,
+      socios_receita
     ]
   );
   return ins.insertId;
 }
 
-async function createPessoa(conn, empresaId, pessoaInput) {
+/* ========= pessoa ========= */
+async function createPessoa(conn, pessoaInput) {
   const {
     nome, cpf = "", data_nascimento = null, telefone = null, email = null,
   } = pessoaInput;
@@ -122,17 +121,12 @@ async function createPessoa(conn, empresaId, pessoaInput) {
   const [ins] = await conn.query(
     `INSERT INTO pessoas (nome, cpf, data_nascimento, telefone, email)
      VALUES (?,?,?,?,?)`,
-    [
-      nome,
-      cpfNum || null,
-      toDateOrNull(data_nascimento), // normaliza data de nascimento
-      (telefone || "").trim() || null,
-      (email || "").trim() || null
-    ]
+    [limit(nome,150), cpfNum || null, toYYYYMMDDorNull(data_nascimento), limit(telefone,20), limit(email,150)]
   );
   return ins.insertId;
 }
 
+/* ========= usuário ========= */
 async function createUsuario(conn, usuarioInput, pessoaNome) {
   const { nome = pessoaNome, email, senha, ativo = 1 } = usuarioInput;
   if (!email?.trim() || !senha?.trim()) throw new Error("E-mail e senha são obrigatórios.");
@@ -140,11 +134,12 @@ async function createUsuario(conn, usuarioInput, pessoaNome) {
 
   const [ins] = await conn.query(
     `INSERT INTO usuarios (nome, email, senha, ativo) VALUES (?,?,?,?)`,
-    [nome, email, hash, ativo ? 1 : 0]
+    [limit(nome,150), String(email).trim().toLowerCase(), hash, ativo ? 1 : 0]
   );
   return ins.insertId;
 }
 
+/* ========= perfil/vínculos ========= */
 async function getOrCreatePerfilAdministrador(conn, empresaId) {
   const [p] = await conn.query(
     "SELECT id FROM perfis WHERE empresa_id = ? AND nome = 'administrador' LIMIT 1",
@@ -160,7 +155,6 @@ async function getOrCreatePerfilAdministrador(conn, empresaId) {
   }
   return perfilId;
 }
-
 async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   await conn.query(
     `INSERT IGNORE INTO usuarios_perfis (empresa_id, usuario_id, perfil_id)
@@ -174,12 +168,10 @@ async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   );
 }
 
-/* ===================== Rotas ===================== */
+/* ========= rotas ========= */
 
 /**
  * POST /api/registro/completo
- * Cria empresa (se não existir), pessoa, usuário (ativo=1),
- * garante perfil 'administrador' e vincula usuário ao perfil/empresa.
  * Body: { empresa:{...}, pessoa:{...}, usuario:{...} }
  */
 router.post("/completo", async (req, res) => {
@@ -190,7 +182,7 @@ router.post("/completo", async (req, res) => {
     await conn.beginTransaction();
 
     const empresaId = await getOrCreateEmpresaByCNPJ(conn, empresa);
-    const pessoaId  = await createPessoa(conn, empresaId, pessoa);
+    const pessoaId  = await createPessoa(conn, pessoa);
     const usuarioId = await createUsuario(conn, usuario, pessoa.nome);
     const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
 
@@ -208,7 +200,7 @@ router.post("/completo", async (req, res) => {
     if (conn) await conn.rollback();
     console.error("REGISTER_COMPLETO_ERR", e);
     const msg = String(e?.message || "");
-    const friendly = /reservado|inválido|Duplicate entry|CNPJ inválido/i.test(msg)
+    const friendly = /reservado|inválido|Duplicate entry|CNPJ|CPF/i.test(msg)
       ? msg
       : "Não foi possível concluir o cadastro.";
     return res.status(400).json({ ok: false, error: friendly });
@@ -219,37 +211,39 @@ router.post("/completo", async (req, res) => {
 
 /**
  * POST /api/registro/vincular-admin
- * Usuário já autenticado (usa req.session.uid).
- * Garante empresa (por CNPJ), garante perfil 'administrador' e vincula ao usuário atual.
- * Body: { empresa:{...} }
+ * Body: { empresa:{...} }  (usuário já autenticado via cookie)
  */
 router.post("/vincular-admin", async (req, res) => {
-  const uid = req.session?.uid;
-  if (!uid) return res.status(401).json({ ok: false, error: "Não autenticado." });
-
-  const { empresa = {} } = req.body || {};
-  let conn;
+  const uid = req.userId || null; // se você usa middleware, ajuste aqui
   try {
-    conn = await pool.getConnection();
+    // fallback simples usando JWT direto do cookie
+    let userId = uid;
+    if (!userId) {
+      const { token } = req.cookies || {};
+      if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
+      const payload = JSON.parse(Buffer.from(token.split(".")[1] || "", "base64").toString() || "{}");
+      userId = payload.sub;
+    }
+
+    const { empresa = {} } = req.body || {};
+    let conn = await pool.getConnection();
     await conn.beginTransaction();
 
     const empresaId = await getOrCreateEmpresaByCNPJ(conn, empresa);
     const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
 
-    await linkUsuarioPerfil(conn, empresaId, uid, perfilId);
+    await linkUsuarioPerfil(conn, empresaId, userId, perfilId);
 
     await conn.commit();
+    conn.release();
     return res.json({ ok: true, empresa_id: empresaId, perfil_id: perfilId });
   } catch (e) {
-    if (conn) await conn.rollback();
     console.error("REGISTER_VINCULAR_ERR", e);
     const msg = String(e?.message || "");
-    const friendly = /reservado|inválido|Duplicate entry|CNPJ inválido/i.test(msg)
+    const friendly = /reservado|inválido|Duplicate entry|CNPJ|CPF/i.test(msg)
       ? msg
       : "Não foi possível vincular a empresa ao usuário.";
     return res.status(400).json({ ok: false, error: friendly });
-  } finally {
-    if (conn) conn.release();
   }
 });
 
