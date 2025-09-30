@@ -3,6 +3,7 @@ import { Router } from "express";
 import { pool } from "../db.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import rateLimit from "express-rate-limit"; // ← ADD
 
 const router = Router();
 
@@ -33,13 +34,7 @@ async function getUserRoles(userId) {
   return rows.map((r) => r.perfil_nome);
 }
 
-/* ===================== Cookies (set/clear) ===================== */
-/**
- * Importante: Express 5 deprecou passar `maxAge` em `res.clearCookie`.
- * Mantemos as opções em funções separadas:
- * - cookieSetOptions(): usar em res.cookie (inclui maxAge)
- * - cookieClearOptions(): usar em res.clearCookie (sem maxAge)
- */
+/* ===================== Cookies ===================== */
 
 function cookieOptionsBase() {
   const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
@@ -81,6 +76,20 @@ function cookieClearOptions() {
     ...cookieOptionsBase(),
   };
 }
+
+/* ===================== Rate limit SOMENTE no /login ===================== */
+
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 20,             // até 20 tentativas por minuto
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const ip = req.ip || req.headers["x-forwarded-for"] || "ip";
+    const email = String(req.body?.email || "").toLowerCase();
+    return `${ip}:${email}`;
+  },
+});
 
 /* ===================== /register ===================== */
 
@@ -132,9 +141,9 @@ router.post("/register", async (req, res) => {
   }
 });
 
-/* ===================== /login ===================== */
+/* ===================== /login (com limiter) ===================== */
 
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   try {
     let { email, senha } = req.body || {};
     if (!email || !senha) {
