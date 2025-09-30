@@ -131,10 +131,10 @@ async function ensureCanAccessEmpresa(userId, empresaId) {
 }
 
 /* =========================================================
-   1) Consulta CNPJ (mantido do seu código atual)
+   1) Consulta CNPJ (pública para o fluxo de cadastro)
    ========================================================= */
 
-// helper: fetch com timeout (mantido)
+// helper: fetch com timeout
 async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -147,7 +147,8 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   }
 }
 
-router.post("/consulta-cnpj", requireAuth, async (req, res) => {
+// 🔓 PÚBLICA — não usa requireAuth
+router.post("/consulta-cnpj", async (req, res) => {
   try {
     const num = onlyDigits(req.body?.cnpj);
     if (num.length !== 14) {
@@ -195,15 +196,17 @@ router.post("/consulta-cnpj", requireAuth, async (req, res) => {
 });
 
 /* =========================================================
-   2) LISTAR / OBTER / CRIAR / ATUALIZAR EMPRESAS
+   2) A PARTIR DAQUI: tudo exige autenticação
    ========================================================= */
+
+router.use(requireAuth);
 
 /**
  * GET /api/empresas?scope=mine|all
  * - dev: pode usar scope=all (todas)
  * - demais: sempre mine (vinculadas)
  */
-router.get("/", requireAuth, async (req, res) => {
+router.get("/", async (req, res) => {
   try {
     const roles = await getUserRoles(req.userId);
     const scope = String(req.query.scope || "mine").toLowerCase();
@@ -238,7 +241,7 @@ router.get("/", requireAuth, async (req, res) => {
  * GET /api/empresas/:id
  * Detalhe (dev ou vinculado)
  */
-router.get("/:id", requireAuth, async (req, res) => {
+router.get("/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     await ensureCanAccessEmpresa(req.userId, id);
@@ -265,7 +268,7 @@ router.get("/:id", requireAuth, async (req, res) => {
  * POST /api/empresas
  * Cria (somente desenvolvedor)
  */
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", async (req, res) => {
   try {
     const roles = await getUserRoles(req.userId);
     if (!isDev(roles)) return res.status(403).json({ ok: false, error: "Apenas desenvolvedor pode criar empresas." });
@@ -308,7 +311,7 @@ router.post("/", requireAuth, async (req, res) => {
  * PUT /api/empresas/:id
  * Atualiza (dev ou vinculado). CNPJ NÃO é alterado aqui.
  */
-router.put("/:id", requireAuth, async (req, res) => {
+router.put("/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     await ensureCanAccessEmpresa(req.userId, id);
@@ -326,7 +329,7 @@ router.put("/:id", requireAuth, async (req, res) => {
       [
         e.razao_social, e.nome_fantasia, e.inscricao_estadual, e.data_abertura,
         e.telefone, e.email, e.capital_social, e.natureza_juridica,
-        e.situacao_cadastral, e.data_situacao, e.socios_receita, e.ativa ? 1 : 0,
+        e.situacao_cadastral, e.data_situicao || e.data_situacao, e.socios_receita, e.ativa ? 1 : 0,
         id
       ]
     );
