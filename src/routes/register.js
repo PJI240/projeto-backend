@@ -95,7 +95,7 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
       cnpjNum,
       inscricao_estadual,
       data_abertura,
-      telefone, // <= sempre <= 20 ou null
+      telefone,
       email,
       capital_social,
       natureza_juridica,
@@ -168,9 +168,8 @@ async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   );
 }
 
-/* ========= NOVO: usuário × pessoa ========= */
+/* ========= usuário × pessoa ========= */
 async function linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId) {
-  // Garante o vínculo 1–1 no escopo da empresa (chave única recomendada no banco)
   await conn.query(
     `INSERT IGNORE INTO usuarios_pessoas (empresa_id, usuario_id, pessoa_id)
      VALUES (?,?,?)`,
@@ -178,14 +177,52 @@ async function linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId) {
   );
 }
 
+/* ========= cargos/funcionários ========= */
+async function getOrCreateCargoByName(conn, empresaId, nomeCargo) {
+  const [rows] = await conn.query(
+    "SELECT id FROM cargos WHERE empresa_id = ? AND nome = ? LIMIT 1",
+    [empresaId, nomeCargo]
+  );
+  if (rows.length) return rows[0].id;
+
+  const [ins] = await conn.query(
+    "INSERT INTO cargos (empresa_id, nome, descricao, ativo) VALUES (?,?,?,1)",
+    [empresaId, nomeCargo, "Cargo padrão gerado automaticamente no registro"]
+  );
+  return ins.insertId;
+}
+
+async function createFuncionarioIfNotExists(conn, { empresaId, pessoaId, cargoId }) {
+  // salario_base = 0.00 conforme solicitado
+  await conn.query(
+    `INSERT IGNORE INTO funcionarios
+       (empresa_id, pessoa_id, cargo_id, regime, salario_base, valor_hora, ativo)
+     VALUES (?,?,?,?,?,?,1)`,
+    [
+      empresaId,
+      pessoaId,
+      cargoId,
+      "MENSALISTA",
+      0.00,
+      null
+    ]
+  );
+
+  const [f] = await conn.query(
+    "SELECT id FROM funcionarios WHERE empresa_id = ? AND pessoa_id = ? LIMIT 1",
+    [empresaId, pessoaId]
+  );
+  return f[0]?.id || null;
+}
+
 /* ========= rotas ========= */
 
 /**
  * POST /api/registro/completo
  * Body: { empresa:{...}, pessoa:{...}, usuario:{...} }
- * Cria empresa (se necessário), cria pessoa, cria usuário (ativo=1),
- * garante perfil 'administrador', vincula usuário→perfil/empresa
- * E AGORA: vincula usuário→pessoa em usuarios_pessoas.
+ * Cria empresa (se necessário), pessoa, usuário,
+ * garante perfil 'administrador', vincula usuário→perfil/empresa,
+ * vincula usuário→pessoa e cria funcionário (pessoa↔empresa) com cargo "colaborador".
  */
 router.post("/completo", async (req, res) => {
   const { empresa = {}, pessoa = {}, usuario = {} } = req.body || {};
@@ -200,7 +237,15 @@ router.post("/completo", async (req, res) => {
     const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
 
     await linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId);
-    await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId); // <<< NOVO
+    await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId);
+
+    // cargo padrão e funcionário
+    const cargoId = await getOrCreateCargoByName(conn, empresaId, "colaborador");
+    const funcionarioId = await createFuncionarioIfNotExists(conn, {
+      empresaId,
+      pessoaId,
+      cargoId
+    });
 
     await conn.commit();
     return res.json({
@@ -209,6 +254,7 @@ router.post("/completo", async (req, res) => {
       pessoa_id: pessoaId,
       usuario_id: usuarioId,
       perfil_id: perfilId,
+      funcionario_id: funcionarioId
     });
   } catch (e) {
     if (conn) await conn.rollback();
@@ -226,11 +272,11 @@ router.post("/completo", async (req, res) => {
 /**
  * POST /api/registro/vincular-admin
  * Body: { empresa:{...} }  (usuário já autenticado via cookie)
- * Obs.: aqui não criamos usuarios_pessoas porque é um fluxo
- * de “vincular nova empresa” para um usuário que pode já ter pessoa.
+ * Obs.: aqui não criamos usuarios_pessoas nem funcionário,
+ * pois é um fluxo de “vincular nova empresa” para um usuário já existente.
  */
 router.post("/vincular-admin", async (req, res) => {
-  const uid = req.userId || null; // se você usa middleware de auth, injete aqui
+  const uid = req.userId || null; // injete via middleware se tiver
   try {
     // fallback simples usando JWT do cookie
     let userId = uid;
