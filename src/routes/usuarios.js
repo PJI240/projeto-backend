@@ -6,35 +6,6 @@ import { pool } from "../db.js";
 
 const router = Router();
 
-/* ========== bootstrap: cria tabela de vínculo 1:1 se não existir ========== */
-/**
- * usuarios_pessoas
- *  - empresa_id INT NOT NULL
- *  - usuario_id INT NOT NULL
- *  - pessoa_id  INT NOT NULL (UNIQUE → uma pessoa só pode ter um usuário)
- *  Constraints:
- *    - UNIQUE(pessoa_id)
- *    - UNIQUE(empresa_id, usuario_id) → evita duplicidade de vínculo por empresa
- */
-async function ensureUsuariosPessoasTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS usuarios_pessoas (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      empresa_id INT NOT NULL,
-      usuario_id INT NOT NULL,
-      pessoa_id INT NOT NULL,
-      UNIQUE KEY uq_pessoa (pessoa_id),
-      UNIQUE KEY uq_empresa_usuario (empresa_id, usuario_id),
-      CONSTRAINT fk_up_empresa FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE CASCADE,
-      CONSTRAINT fk_up_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE,
-      CONSTRAINT fk_up_pessoa  FOREIGN KEY (pessoa_id)  REFERENCES pessoas(id)  ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
-}
-ensureUsuariosPessoasTable().catch((e) => {
-  console.error("BOOTSTRAP usuarios_pessoas ERR:", e);
-});
-
 /* ========== helpers compartilhados ========== */
 
 function requireAuth(req, res, next) {
@@ -59,7 +30,6 @@ async function getUserEmpresaIds(userId) {
   return rows.map((r) => r.empresa_id);
 }
 
-/** Resolve empresa corrente (id passado e permitido, ou a 1ª do usuário) */
 async function resolveEmpresaContext(userId, empresaIdQuery) {
   const empresas = await getUserEmpresaIds(userId);
   if (!empresas.length) throw new Error("Usuário sem empresa vinculada.");
@@ -75,11 +45,9 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 function normalize(s = "") {
   return String(s || "").trim();
 }
-
 function normalizeRoleName(s = "") {
   return String(s).trim().toLowerCase();
 }
-
 async function getUserRoles(userId) {
   const [rows] = await pool.query(
     `SELECT p.nome AS perfil_nome
@@ -90,18 +58,36 @@ async function getUserRoles(userId) {
   );
   return rows.map((r) => normalizeRoleName(r.perfil_nome));
 }
-
 function canAssignAdmin(roles = []) {
   const r = roles.map(normalizeRoleName);
   return r.includes("desenvolvedor") || r.includes("administrador");
 }
+function isAdminName(nome) {
+  return String(nome || "").trim().toLowerCase() === "administrador";
+}
+async function isUserAdminInCompany(empresaId, usuarioId) {
+  const [[row]] = await pool.query(
+    `SELECT 1
+       FROM usuarios_perfis up
+       JOIN perfis p ON p.id = up.perfil_id
+      WHERE up.empresa_id = ? AND up.usuario_id = ? AND LOWER(p.nome) = 'administrador'
+      LIMIT 1`,
+    [empresaId, usuarioId]
+  );
+  return !!row;
+}
+async function countAdminsInCompany(empresaId) {
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS qtd
+       FROM usuarios_perfis up
+       JOIN perfis p ON p.id = up.perfil_id
+      WHERE up.empresa_id = ? AND LOWER(p.nome) = 'administrador'`,
+    [empresaId]
+  );
+  return Number(row?.qtd || 0);
+}
 
 /* ========== GET /api/usuarios (lista por empresa) ========== */
-/**
- * Retorna usuários vinculados à empresa corrente, com:
- *  - pessoa (via usuarios_pessoas)
- *  - perfil principal (via usuarios_perfis) — 1 por empresa/usuário
- */
 router.get("/", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
@@ -132,32 +118,13 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 /* ========== POST /api/usuarios (criar + vincular) ========== */
-/**
- * Body: {
- *   pessoa_id, nome, email, senha, perfil_id, ativo
- * }
- * Passos:
- *   1) valida perfil permitido (se admin) e unicidade email
- *   2) cria usuario
- *   3) vincula em empresas_usuarios (ativo=1)
- *   4) vincula pessoa 1:1 (usuarios_pessoas) — UNIQUE(pessoa_id)
- *   5) vincula perfil (usuarios_perfis)
- */
 router.post("/", requireAuth, async (req, res) => {
   let conn;
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const myRoles = await getUserRoles(req.userId);
 
-    let {
-      pessoa_id,
-      nome,
-      email,
-      senha,
-      perfil_id,
-      ativo = 1,
-    } = req.body || {};
-
+    let { pessoa_id, nome, email, senha, perfil_id, ativo = 1 } = req.body || {};
     pessoa_id = Number(pessoa_id);
     perfil_id = Number(perfil_id);
     nome = normalize(nome);
@@ -168,7 +135,6 @@ router.post("/", requireAuth, async (req, res) => {
     if (!nome || !email || !senha) return res.status(400).json({ ok: false, error: "Nome, e-mail e senha são obrigatórios." });
     if (!perfil_id) return res.status(400).json({ ok: false, error: "Perfil é obrigatório." });
 
-    // valida perfil pertence à empresa + regra de admin
     const [[perfil]] = await pool.query(
       `SELECT id, nome FROM perfis WHERE id = ? AND empresa_id = ? LIMIT 1`,
       [perfil_id, empresaId]
@@ -181,22 +147,21 @@ router.post("/", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // 1) pessoa existe?
     const [[pOk]] = await conn.query(`SELECT id FROM pessoas WHERE id = ? LIMIT 1`, [pessoa_id]);
     if (!pOk) throw new Error("Pessoa inexistente.");
 
-    // 2) pessoa já tem usuário? (1:1)
     const [[pLink]] = await conn.query(
       `SELECT id FROM usuarios_pessoas WHERE pessoa_id = ? LIMIT 1`,
       [pessoa_id]
     );
     if (pLink) throw new Error("Esta pessoa já está vinculada a um usuário.");
 
-    // 3) email único
-    const [[uExists]] = await conn.query(`SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`, [email]);
+    const [[uExists]] = await conn.query(
+      `SELECT id FROM usuarios WHERE LOWER(email) = ? LIMIT 1`,
+      [email]
+    );
     if (uExists) throw new Error("E-mail já cadastrado.");
 
-    // 4) cria usuário
     const hash = await bcrypt.hash(senha, 12);
     const [insU] = await conn.query(
       `INSERT INTO usuarios (nome, email, senha, ativo) VALUES (?,?,?,?)`,
@@ -204,20 +169,17 @@ router.post("/", requireAuth, async (req, res) => {
     );
     const usuarioId = insU.insertId;
 
-    // 5) vincula à empresa
     await conn.query(
       `INSERT INTO empresas_usuarios (empresa_id, usuario_id, perfil_principal, ativo)
        VALUES (?,?,?,1)`,
       [empresaId, usuarioId, normalize(perfil.nome)]
     );
 
-    // 6) vínculo 1:1 pessoa↔usuario nesta empresa
     await conn.query(
       `INSERT INTO usuarios_pessoas (empresa_id, usuario_id, pessoa_id) VALUES (?,?,?)`,
       [empresaId, usuarioId, pessoa_id]
     );
 
-    // 7) vincula perfil
     await conn.query(
       `INSERT INTO usuarios_perfis (empresa_id, usuario_id, perfil_id) VALUES (?,?,?)`,
       [empresaId, usuarioId, perfil_id]
@@ -238,7 +200,7 @@ router.post("/", requireAuth, async (req, res) => {
   }
 });
 
-// ========== PUT /api/usuarios/:id ==========
+/* ========== PUT /api/usuarios/:id ========== */
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -255,7 +217,6 @@ router.put("/:id", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // garante vínculo
     const [[uOk]] = await conn.query(
       `SELECT u.id, u.email, u.nome
          FROM empresas_usuarios eu
@@ -266,7 +227,6 @@ router.put("/:id", requireAuth, async (req, res) => {
     );
     if (!uOk) throw new Error("Usuário não pertence à empresa selecionada.");
 
-    // e-mail único se mudou
     if (email && email !== String(uOk.email).toLowerCase()) {
       const [[dup]] = await conn.query(
         `SELECT id FROM usuarios WHERE LOWER(email) = ? AND id <> ? LIMIT 1`,
@@ -275,20 +235,19 @@ router.put("/:id", requireAuth, async (req, res) => {
       if (dup) throw new Error("E-mail já utilizado por outro usuário.");
     }
 
-    // perfil válido?
     if (!perfil_id) throw new Error("Perfil é obrigatório.");
     const [[perfil]] = await conn.query(
       `SELECT id, nome FROM perfis WHERE id = ? AND empresa_id = ? LIMIT 1`,
       [perfil_id, empresaId]
     );
     if (!perfil) throw new Error("Perfil inválido para esta empresa.");
+
     const novoPerfilAdmin = isAdminName(perfil.nome);
     const podeAtribuirAdmin = myRoles.some(r => ["desenvolvedor","administrador"].includes(String(r).toLowerCase()));
     if (novoPerfilAdmin && !podeAtribuirAdmin) {
       throw new Error("Você não pode atribuir o perfil Administrador.");
     }
 
-    // BLOQUEIO “último admin”: se usuário ATUALMENTE é admin e é o último, não pode trocar para não-admin ou desativar
     const ehAdminAtual = await isUserAdminInCompany(empresaId, id);
     if (ehAdminAtual) {
       const qtdAdmins = await countAdminsInCompany(empresaId);
@@ -298,7 +257,6 @@ router.put("/:id", requireAuth, async (req, res) => {
       }
     }
 
-    // atualiza usuario
     if (senha) {
       const hash = await bcrypt.hash(senha, 12);
       await conn.query(
@@ -312,13 +270,11 @@ router.put("/:id", requireAuth, async (req, res) => {
       );
     }
 
-    // atualiza perfil principal
     await conn.query(
       `UPDATE empresas_usuarios SET perfil_principal = ? WHERE empresa_id = ? AND usuario_id = ?`,
       [normalize(perfil.nome), empresaId, id]
     );
 
-    // reatribui perfil
     await conn.query(
       `DELETE FROM usuarios_perfis WHERE empresa_id = ? AND usuario_id = ?`,
       [empresaId, id]
@@ -339,14 +295,13 @@ router.put("/:id", requireAuth, async (req, res) => {
   }
 });
 
-// ========== DELETE /api/usuarios/:id ==========
+/* ========== DELETE /api/usuarios/:id ========== */
 router.delete("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
 
-    // Se este usuário é admin e é o último, bloquear
     const ehAdmin = await isUserAdminInCompany(empresaId, id);
     if (ehAdmin) {
       const qtdAdmins = await countAdminsInCompany(empresaId);
@@ -364,7 +319,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
     );
     if (!uOk) throw new Error("Usuário não pertence à empresa selecionada.");
 
-    await conn.query(`DELETE FROM usuarios_perfis WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
+    await conn.query(`DELETE FROM usuarios_perfis  WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
     await conn.query(`DELETE FROM usuarios_pessoas WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
     await conn.query(`DELETE FROM empresas_usuarios WHERE empresa_id = ? AND usuario_id = ?`, [empresaId, id]);
 
@@ -381,4 +336,5 @@ router.delete("/:id", requireAuth, async (req, res) => {
     if (conn) conn.release();
   }
 });
+
 export default router;
