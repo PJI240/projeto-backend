@@ -14,10 +14,10 @@ const trimOrNull = (s) => {
 const limit = (s, n) => (s == null ? null : String(s).slice(0, n));
 const toYYYYMMDDorNull = (s) => {
   if (!s) return null;
-  const t = String(s);
-  // aceita "YYYY-MM-DD" já normalizado
+  const t = String(s).trim();
+  // "YYYY-MM-DD"
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
-  // tenta "DD/MM/YYYY"
+  // "DD/MM/YYYY"
   const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   return null;
@@ -66,7 +66,7 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   const nome_fantasia      = limit(trimOrNull(empresaInput.nome_fantasia), 255);
   const inscricao_estadual = limit(trimOrNull(empresaInput.inscricao_estadual), 50);
   const data_abertura      = toYYYYMMDDorNull(empresaInput.data_abertura);
-  const telefone           = normalizePhone(empresaInput.telefone);               // <= aqui o fix
+  const telefone           = normalizePhone(empresaInput.telefone);
   const email              = limit(trimOrNull(empresaInput.email), 255);
   const capital_social     = Number.isFinite(+empresaInput.capital_social)
     ? +empresaInput.capital_social
@@ -80,7 +80,6 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   if (Array.isArray(empresaInput.socios_receita) || typeof empresaInput.socios_receita === "object") {
     try { socios_receita = JSON.stringify(empresaInput.socios_receita); } catch {}
   } else if (typeof empresaInput.socios_receita === "string") {
-    // se já for JSON válido, usa; senão, "[]"
     try { JSON.parse(empresaInput.socios_receita); socios_receita = empresaInput.socios_receita; } catch {}
   }
 
@@ -96,7 +95,7 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
       cnpjNum,
       inscricao_estadual,
       data_abertura,
-      telefone,                // agora sempre <= 20 ou null
+      telefone, // <= sempre <= 20 ou null
       email,
       capital_social,
       natureza_juridica,
@@ -155,6 +154,7 @@ async function getOrCreatePerfilAdministrador(conn, empresaId) {
   }
   return perfilId;
 }
+
 async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   await conn.query(
     `INSERT IGNORE INTO usuarios_perfis (empresa_id, usuario_id, perfil_id)
@@ -168,11 +168,24 @@ async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   );
 }
 
+/* ========= NOVO: usuário × pessoa ========= */
+async function linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId) {
+  // Garante o vínculo 1–1 no escopo da empresa (chave única recomendada no banco)
+  await conn.query(
+    `INSERT IGNORE INTO usuarios_pessoas (empresa_id, usuario_id, pessoa_id)
+     VALUES (?,?,?)`,
+    [empresaId, usuarioId, pessoaId]
+  );
+}
+
 /* ========= rotas ========= */
 
 /**
  * POST /api/registro/completo
  * Body: { empresa:{...}, pessoa:{...}, usuario:{...} }
+ * Cria empresa (se necessário), cria pessoa, cria usuário (ativo=1),
+ * garante perfil 'administrador', vincula usuário→perfil/empresa
+ * E AGORA: vincula usuário→pessoa em usuarios_pessoas.
  */
 router.post("/completo", async (req, res) => {
   const { empresa = {}, pessoa = {}, usuario = {} } = req.body || {};
@@ -187,6 +200,7 @@ router.post("/completo", async (req, res) => {
     const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
 
     await linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId);
+    await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId); // <<< NOVO
 
     await conn.commit();
     return res.json({
@@ -212,11 +226,13 @@ router.post("/completo", async (req, res) => {
 /**
  * POST /api/registro/vincular-admin
  * Body: { empresa:{...} }  (usuário já autenticado via cookie)
+ * Obs.: aqui não criamos usuarios_pessoas porque é um fluxo
+ * de “vincular nova empresa” para um usuário que pode já ter pessoa.
  */
 router.post("/vincular-admin", async (req, res) => {
-  const uid = req.userId || null; // se você usa middleware, ajuste aqui
+  const uid = req.userId || null; // se você usa middleware de auth, injete aqui
   try {
-    // fallback simples usando JWT direto do cookie
+    // fallback simples usando JWT do cookie
     let userId = uid;
     if (!userId) {
       const { token } = req.cookies || {};
@@ -226,7 +242,7 @@ router.post("/vincular-admin", async (req, res) => {
     }
 
     const { empresa = {} } = req.body || {};
-    let conn = await pool.getConnection();
+    const conn = await pool.getConnection();
     await conn.beginTransaction();
 
     const empresaId = await getOrCreateEmpresaByCNPJ(conn, empresa);
@@ -236,6 +252,7 @@ router.post("/vincular-admin", async (req, res) => {
 
     await conn.commit();
     conn.release();
+
     return res.json({ ok: true, empresa_id: empresaId, perfil_id: perfilId });
   } catch (e) {
     console.error("REGISTER_VINCULAR_ERR", e);
