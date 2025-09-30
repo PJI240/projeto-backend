@@ -39,7 +39,7 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
     if (empresas.includes(id)) return id;
     throw new Error("Empresa não autorizada.");
   }
-  return empresas[0]; // default: primeira da lista do usuário
+  return empresas[0]; // default
 }
 
 function isValidISODate(s = "") {
@@ -67,13 +67,23 @@ async function assertFuncionarioEmpresa(conn, funcionarioId, empresaId) {
   if (!row) throw new Error("Funcionário não pertence à empresa selecionada.");
 }
 
+/** Se ambos horários existem, garante entrada < saída */
+function assertEntradaAntesSaida(entrada, saida) {
+  if (!entrada || !saida) return;
+  const [h1, m1] = entrada.split(":").map(Number);
+  const [h2, m2] = saida.split(":").map(Number);
+  const a = h1 * 60 + m1;
+  const b = h2 * 60 + m2;
+  if (!(a < b)) throw new Error("Horário de entrada deve ser anterior ao horário de saída.");
+}
+
 /* ===================== GET /api/escalas ===================== */
 /**
  * Lista escalas da empresa do usuário dentro de um intervalo (inclusive).
  * Query:
  *   - from=YYYY-MM-DD
  *   - to=YYYY-MM-DD
- *   - empresa_id (opcional, se usuário tiver várias)
+ *   - empresa_id (opcional)
  *
  * Retorna: { ok:true, empresa_id, escalas:[{ id, funcionario_id, data, turno_ordem, entrada, saida, origem }] }
  */
@@ -86,13 +96,22 @@ router.get("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Parâmetros 'from' e 'to' devem estar em YYYY-MM-DD." });
     }
 
+    // Formata no SELECT: data em YYYY-MM-DD, times em HH:MM (sem segundos)
     const [rows] = await pool.query(
       `
-        SELECT id, empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem
-          FROM escalas
-         WHERE empresa_id = ?
-           AND data BETWEEN ? AND ?
-         ORDER BY funcionario_id ASC, data ASC, turno_ordem ASC
+        SELECT
+          e.id,
+          e.empresa_id,
+          e.funcionario_id,
+          DATE_FORMAT(e.data, '%Y-%m-%d')        AS data,
+          e.turno_ordem,
+          TIME_FORMAT(e.entrada, '%H:%i')        AS entrada,
+          TIME_FORMAT(e.saida,   '%H:%i')        AS saida,
+          e.origem
+        FROM escalas e
+        WHERE e.empresa_id = ?
+          AND e.data BETWEEN ? AND ?
+        ORDER BY e.funcionario_id ASC, e.data ASC, e.turno_ordem ASC
       `,
       [empresaId, from, to]
     );
@@ -106,16 +125,15 @@ router.get("/", requireAuth, async (req, res) => {
 
 /* ===================== POST /api/escalas ===================== */
 /**
- * Cria uma escala (turno) para um funcionário.
  * Body: {
  *   funcionario_id: number,
  *   data: "YYYY-MM-DD",
  *   turno_ordem: number (>=1),
  *   entrada: "HH:MM" | null,
- *   saida: "HH:MM" | null,
+ *   saida:   "HH:MM" | null,
  *   origem: "FIXA" | "EXCECAO"
  * }
- * Regra de unicidade: (empresa_id, funcionario_id, data, turno_ordem)
+ * Unicidade recomendada: (empresa_id, funcionario_id, data, turno_ordem)
  */
 router.post("/", requireAuth, async (req, res) => {
   let conn;
@@ -136,13 +154,13 @@ router.post("/", requireAuth, async (req, res) => {
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
       return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)." });
     }
+    assertEntradaAntesSaida(entrada, saida);
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
     await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
 
-    // insere
     const [ins] = await conn.query(
       `INSERT INTO escalas
          (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem)
@@ -174,10 +192,6 @@ router.post("/", requireAuth, async (req, res) => {
 });
 
 /* ===================== PUT /api/escalas/:id ===================== */
-/**
- * Atualiza um turno de escala existente.
- * Mesmos campos do POST; respeita unicidade.
- */
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -199,13 +213,14 @@ router.put("/:id", requireAuth, async (req, res) => {
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
       return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)." });
     }
+    assertEntradaAntesSaida(entrada, saida);
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
     // verifica se o registro é da empresa
     const [[row]] = await conn.query(
-      `SELECT id, empresa_id, funcionario_id FROM escalas WHERE id = ? LIMIT 1`,
+      `SELECT id, empresa_id FROM escalas WHERE id = ? LIMIT 1`,
       [id]
     );
     if (!row || row.empresa_id !== empresaId) {
@@ -214,7 +229,6 @@ router.put("/:id", requireAuth, async (req, res) => {
 
     await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
 
-    // atualiza
     await conn.query(
       `UPDATE escalas
           SET funcionario_id = ?,
