@@ -16,8 +16,7 @@ import perfisRoutes from "./routes/perfis.js";
 import permissoesRoutes from "./routes/permissoes.js";
 import perfisPermissoesRoutes from "./routes/perfis_permissoes.js";
 import usuariosPerfisRoutes from "./routes/usuarios_perfis.js";
-
-
+import escalasRoutes from "./routes/escalas.js";
 
 const CONFIG = {
   JWT_SECRET: process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
@@ -109,6 +108,7 @@ app.use("/api/perfis", perfisRoutes);
 app.use("/api/permissoes", permissoesRoutes);
 app.use("/api/perfis_permissoes", perfisPermissoesRoutes);
 app.use("/api/usuarios_perfis", usuariosPerfisRoutes);
+app.use("/api/escalas", escalasRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
