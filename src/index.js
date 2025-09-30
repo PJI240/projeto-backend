@@ -99,12 +99,6 @@ app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
-// 5) Rate limit (ex.: em /api/auth)
-const authLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-});
 
 /** =========================================
  *  ROTAS
