@@ -2,7 +2,6 @@
 import express from "express";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 import cors from "cors";
 
 import authRoutes from "./routes/auth.js";
@@ -16,10 +15,8 @@ import usuariosRoutes from "./routes/usuarios.js";
 import perfisRoutes from "./routes/perfis.js";
 import permissoesRoutes from "./routes/permissoes.js";
 
-
 const CONFIG = {
-  JWT_SECRET:
-    process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
+  JWT_SECRET: process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
   DATABASE_URL:
     process.env.DATABASE_URL ||
     "mysql://root:rZJv0sIAPRpqtNtlYsgsiHQICPwVUasu@yamanbiko.proxy.rlwy.net:17978/railway",
@@ -46,7 +43,7 @@ const app = express();
 // 1) Necessário no Railway p/ cookies Secure + SameSite=None
 app.set("trust proxy", 1);
 
-// 2) Segurança base (CORP liberado para não bloquear assets externos)
+// 2) Segurança base
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
@@ -59,7 +56,6 @@ const allowList = (process.env.FRONTEND_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// adiciona defaults úteis se não estiverem presentes
 for (const d of [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
@@ -76,14 +72,10 @@ const corsOptions = {
   allowedHeaders: ["Content-Type", "Authorization"],
   origin(origin, cb) {
     try {
-      // Sem Origin (curl, same-origin) → permite
-      if (!origin) return cb(null, true);
-
+      if (!origin) return cb(null, true); // curl / same-origin
       const ok =
         allowList.includes(origin) || vercelPreviewRe.test(origin);
-
       if (ok) return cb(null, true);
-
       return cb(new Error(`CORS: origin não permitido -> ${origin}`));
     } catch {
       return cb(new Error("CORS: erro ao validar origin"));
@@ -92,22 +84,20 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-// Preflight global com as mesmas opções
 app.options("*", cors(corsOptions));
 
 // 4) Parsers
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
-
 /** =========================================
  *  ROTAS
  *  ========================================= */
-app.use("/api/auth", authLimiter, authRoutes);
+app.use("/api/auth", authRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/registro", registerRoutes);
 app.use("/api/empresas", empresasRoutes);
-app.use("/api/pessoas", pessoasRoutes); 
+app.use("/api/pessoas", pessoasRoutes);
 app.use("/api/cargos", cargosRoutes);
 app.use("/api/funcionarios", funcionariosRoutes);
 app.use("/api/usuarios", usuariosRoutes);
@@ -137,7 +127,7 @@ app.get("/api/dashboard/resumo", (_req, res) => {
 });
 
 /** =========================================
- *  HANDLER GLOBAL DE ERROS (inclui CORS)
+ *  HANDLER GLOBAL DE ERROS
  *  ========================================= */
 app.use((err, _req, res, _next) => {
   const msg = String(err?.message || "");
