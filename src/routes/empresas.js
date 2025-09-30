@@ -4,9 +4,110 @@ import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
 
 const router = express.Router();
-const onlyDigits = (s = "") => String(s).replace(/\D+/g, "");
 
-/* ----------------- Auth & helpers ----------------- */
+/* ===================== helpers util ===================== */
+
+const onlyDigits = (s = "") => (s || "").replace(/\D+/g, "");
+
+function normStr(v) {
+  const s = (v ?? "").toString().trim();
+  return s.length ? s : null;
+}
+
+function toDateOrNull(s) {
+  const v = normStr(s);
+  if (!v) return null;
+  // aceita "YYYY-MM-DD" ou "DD/MM/YYYY"
+  const mIso = v.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const mBr  = v.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (mIso) return v;
+  if (mBr) return `${mBr[3]}-${mBr[2]}-${mBr[1]}`;
+  return null;
+}
+
+function jsonOrStringify(input) {
+  if (input == null || input === "") return "[]";
+  if (typeof input === "string") {
+    try {
+      return JSON.stringify(JSON.parse(input));
+    } catch {
+      return JSON.stringify([String(input)]);
+    }
+  }
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return "[]";
+  }
+}
+
+function isValidCNPJ(raw) {
+  const cnpj = onlyDigits(raw);
+  if (cnpj.length !== 14) return false;
+  if (/^(\d)\1{13}$/.test(cnpj)) return false;
+
+  const calc = (slice) => {
+    let pos = slice.length - 7, sum = 0;
+    for (let i = slice.length; i >= 1; i--) {
+      sum += Number(slice[slice.length - i]) * pos--;
+      if (pos < 2) pos = 9;
+    }
+    const mod = sum % 11;
+    return mod < 2 ? 0 : 11 - mod;
+  };
+
+  const n = cnpj.substring(0, 12);
+  const dv1 = calc(n);
+  const dv2 = calc(n + dv1);
+  return cnpj === n + String(dv1) + String(dv2);
+}
+
+function normalizeEmpresaInput(body) {
+  const cnpjNum = onlyDigits(body?.cnpj || "");
+  return {
+    razao_social:        normStr(body?.razao_social),
+    nome_fantasia:       normStr(body?.nome_fantasia),
+    cnpj:                cnpjNum || null,
+    inscricao_estadual:  normStr(body?.inscricao_estadual),
+    data_abertura:       toDateOrNull(body?.data_abertura),
+    telefone:            normStr(body?.telefone),
+    email:               normStr(body?.email),
+    capital_social:      body?.capital_social === "" || body?.capital_social == null ? null : Number(body.capital_social),
+    natureza_juridica:   normStr(body?.natureza_juridica),
+    situacao_cadastral:  normStr(body?.situacao_cadastral),
+    data_situacao:       toDateOrNull(body?.data_situicao || body?.data_situacao), // aceita as 2 chaves
+    socios_receita:      jsonOrStringify(body?.socios_receita),
+    ativa:               body?.ativa ? 1 : 0,
+  };
+}
+
+/* ===================== helpers auth/scope ===================== */
+
+async function getUserRoles(userId) {
+  const [rows] = await pool.query(
+    `SELECT p.nome AS perfil
+       FROM usuarios_perfis up
+       JOIN perfis p ON p.id = up.perfil_id
+      WHERE up.usuario_id = ?`,
+    [userId]
+  );
+  return rows.map((r) => String(r.perfil || "").toLowerCase());
+}
+
+function isDev(roles = []) {
+  return roles.map((r) => String(r).toLowerCase()).includes("desenvolvedor");
+}
+
+async function getUserEmpresaIds(userId) {
+  const [rows] = await pool.query(
+    `SELECT eu.empresa_id
+       FROM empresas_usuarios eu
+      WHERE eu.usuario_id = ? AND eu.ativo = 1`,
+    [userId]
+  );
+  return rows.map((r) => r.empresa_id);
+}
+
 function requireAuth(req, res, next) {
   try {
     const { token } = req.cookies || {};
@@ -19,51 +120,34 @@ function requireAuth(req, res, next) {
   }
 }
 
-async function getUserEmpresaIds(userId) {
-  const [rows] = await pool.query(
-    `SELECT empresa_id FROM empresas_usuarios WHERE usuario_id = ? AND ativo = 1`,
-    [userId]
-  );
-  return rows.map(r => r.empresa_id);
-}
+async function ensureCanAccessEmpresa(userId, empresaId) {
+  const roles = await getUserRoles(userId);
+  if (isDev(roles)) return true;
 
-async function isDev(userId) {
-  const [rows] = await pool.query(
-    `SELECT 1
-       FROM usuarios_perfis up
-       JOIN perfis p ON p.id = up.perfil_id
-      WHERE up.usuario_id = ? AND LOWER(p.nome) = 'desenvolvedor'
-      LIMIT 1`,
-    [userId]
-  );
-  return rows.length > 0;
-}
-
-async function resolveEmpresaContext(userId, empresaIdQuery) {
   const empresas = await getUserEmpresaIds(userId);
-  if (!empresas.length) throw new Error("Usuário sem empresa vinculada.");
-  if (empresaIdQuery) {
-    const id = Number(empresaIdQuery);
-    if (empresas.includes(id)) return id;
-    throw new Error("Empresa não autorizada.");
-  }
-  return empresas[0];
+  if (empresas.includes(Number(empresaId))) return true;
+
+  throw new Error("Empresa não autorizada.");
 }
 
-/* ----------------- Consulta CNPJ (mantida) ----------------- */
-// fetch c/ timeout (node18 tem global fetch)
+/* =========================================================
+   1) Consulta CNPJ (mantido do seu código atual)
+   ========================================================= */
+
+// helper: fetch com timeout (mantido)
 async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutMs);
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const r = await fetch(url, { signal: ac.signal });
     const data = await r.json().catch(() => null);
     return { ok: r.ok, status: r.status, data };
   } finally {
-    clearTimeout(t);
+    clearTimeout(timer);
   }
 }
-router.post("/consulta-cnpj", async (req, res) => {
+
+router.post("/consulta-cnpj", requireAuth, async (req, res) => {
   try {
     const num = onlyDigits(req.body?.cnpj);
     if (num.length !== 14) {
@@ -75,146 +159,182 @@ router.post("/consulta-cnpj", async (req, res) => {
 
     const { ok, status, data } = await fetchJson(`https://www.receitaws.com.br/v1/cnpj/${num}`);
     if (!ok || !data || data.status !== "OK") {
-      return res.status(502).json({ ok: false, error: "Falha ao consultar a Receita.", upstream: status });
+      return res.status(502).json({
+        ok: false,
+        error: "Falha ao consultar a Receita (tente novamente em instantes).",
+        upstream: status,
+      });
     }
 
     const d = data;
     const empresa = {
-      razao_social: d.nome || "",
-      nome_fantasia: d.fantasia || "",
-      cnpj: num,
+      razao_social:       d.nome || "",
+      nome_fantasia:      d.fantasia || "",
+      cnpj:               num,
       inscricao_estadual: null,
-      data_abertura: d.abertura ? d.abertura.split("/").reverse().join("-") : null,
-      telefone: (String(d.telefone || "").split(/[\/,;]+/)[0] || "").trim(),
-      email: d.email || "",
-      capital_social: (() => {
+      data_abertura:      d.abertura ? d.abertura.split("/").reverse().join("-") : null,
+      telefone:           d.telefone || "",
+      email:              d.email || "",
+      capital_social:     (() => {
         const raw = String(d.capital_social ?? "").replace(/[^\d,.-]/g, "").replace(",", ".");
         const val = parseFloat(raw);
         return Number.isFinite(val) ? val : null;
       })(),
-      natureza_juridica: d.natureza_juridica || "",
-      situacao_cadastral: d.situicao || d.situacao || "",
-      data_situacao: d.data_situicao ? d.data_situicao.split("/").reverse().join("-") : null,
-      socios_receita: d.qsa || [],
+      natureza_juridica:  d.natureza_juridica || "",
+      situacao_cadastral: d.situacao || "",
+      data_situacao:      d.data_situicao ? d.data_situicao.split("/").reverse().join("-") : null,
+      socios_receita:     JSON.stringify(d.qsa || []),
     };
+
     return res.json({ ok: true, empresa });
   } catch (e) {
-    const msg = /abort/i.test(String(e?.message || "")) ? "Tempo de consulta esgotado." : "Erro interno na consulta.";
+    console.error("CNPJ_API_ERR", e?.message);
+    const msg = /abort/i.test(String(e?.message || "")) ? "Tempo de consulta esgotado." : "Erro interno na consulta de CNPJ.";
     return res.status(500).json({ ok: false, error: msg });
   }
 });
 
-/* ----------------- Atalhos de escopo ----------------- */
-router.get("/minhas", requireAuth, async (req, res) => {
-  try {
-    const ids = await getUserEmpresaIds(req.userId);
-    if (!ids.length) return res.json({ ok: true, empresas: [] });
-    const [rows] = await pool.query(
-      `SELECT id, razao_social, nome_fantasia, cnpj, email, telefone, ativa
-         FROM empresas
-        WHERE id IN (?)
-        ORDER BY razao_social`,
-      [ids]
-    );
-    res.json({ ok: true, empresas: rows });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: "Falha ao listar empresas do usuário." });
-  }
-});
+/* =========================================================
+   2) LISTAR / OBTER / CRIAR / ATUALIZAR EMPRESAS
+   ========================================================= */
 
-router.get("/minha", requireAuth, async (req, res) => {
-  try {
-    const empresaId = await resolveEmpresaContext(req.userId, null);
-    const [[row]] = await pool.query(`SELECT * FROM empresas WHERE id = ? LIMIT 1`, [empresaId]);
-    if (!row) return res.status(404).json({ ok: false, error: "Empresa não encontrada." });
-    res.json({ ok: true, empresa: row });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message || "Falha ao obter empresa." });
-  }
-});
-
-/* ----------------- CRUD ----------------- */
-// Lista geral: apenas DEV vê todas; admin/func vê só as suas
+/**
+ * GET /api/empresas?scope=mine|all
+ * - dev: pode usar scope=all (todas)
+ * - demais: sempre mine (vinculadas)
+ */
 router.get("/", requireAuth, async (req, res) => {
   try {
-    if (await isDev(req.userId)) {
+    const roles = await getUserRoles(req.userId);
+    const scope = String(req.query.scope || "mine").toLowerCase();
+
+    if (scope === "all") {
+      if (!isDev(roles)) return res.status(403).json({ ok: false, error: "Acesso negado." });
       const [rows] = await pool.query(
-        `SELECT id, razao_social, nome_fantasia, cnpj, email, telefone, ativa
+        `SELECT id, razao_social, nome_fantasia, cnpj, ativa
            FROM empresas
-          ORDER BY razao_social`
+          ORDER BY razao_social ASC`
       );
-      return res.json({ ok: true, empresas: rows });
+      return res.json({ ok: true, empresas: rows, scope: "all" });
     }
-    // não-dev → delega para /minhas
-    const ids = await getUserEmpresaIds(req.userId);
-    if (!ids.length) return res.json({ ok: true, empresas: [] });
+
+    // mine
     const [rows] = await pool.query(
-      `SELECT id, razao_social, nome_fantasia, cnpj, email, telefone, ativa
-         FROM empresas
-        WHERE id IN (?)
-        ORDER BY razao_social`,
-      [ids]
+      `SELECT e.id, e.razao_social, e.nome_fantasia, e.cnpj, e.ativa
+         FROM empresas e
+         JOIN empresas_usuarios eu ON eu.empresa_id = e.id AND eu.ativo = 1
+        WHERE eu.usuario_id = ?
+        ORDER BY e.razao_social ASC`,
+      [req.userId]
     );
-    return res.json({ ok: true, empresas: rows });
+    return res.json({ ok: true, empresas: rows, scope: "mine" });
   } catch (e) {
-    res.status(400).json({ ok: false, error: "Falha ao listar empresas." });
+    console.error("EMP_LIST_ERR", e);
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao listar empresas." });
   }
 });
 
-// Detalhe: permitido se (dev) ou (empresa pertence ao usuário)
+/**
+ * GET /api/empresas/:id
+ * Detalhe (dev ou vinculado)
+ */
 router.get("/:id", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    if (await isDev(req.userId)) {
-      const [[row]] = await pool.query(`SELECT * FROM empresas WHERE id = ? LIMIT 1`, [id]);
-      if (!row) return res.status(404).json({ ok: false, error: "Empresa não encontrada." });
-      return res.json({ ok: true, empresa: row });
-    }
-    const ids = await getUserEmpresaIds(req.userId);
-    if (!ids.includes(id)) return res.status(404).json({ ok: false, error: "Empresa não autorizada." });
+    await ensureCanAccessEmpresa(req.userId, id);
 
-    const [[row]] = await pool.query(`SELECT * FROM empresas WHERE id = ? LIMIT 1`, [id]);
+    const [[row]] = await pool.query(
+      `SELECT id, razao_social, nome_fantasia, cnpj, inscricao_estadual,
+              data_abertura, telefone, email, capital_social, natureza_juridica,
+              situacao_cadastral, data_situacao, socios_receita, ativa
+         FROM empresas
+        WHERE id = ?
+        LIMIT 1`,
+      [id]
+    );
     if (!row) return res.status(404).json({ ok: false, error: "Empresa não encontrada." });
+
     return res.json({ ok: true, empresa: row });
   } catch (e) {
-    res.status(400).json({ ok: false, error: "Falha ao obter empresa." });
+    console.error("EMP_GET_ERR", e);
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao obter empresa." });
   }
 });
 
-// Atualiza (precisa pertencer ao usuário ou ser dev)
-router.put("/:id", requireAuth, async (req, res) => {
+/**
+ * POST /api/empresas
+ * Cria (somente desenvolvedor)
+ */
+router.post("/", requireAuth, async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    const dev = await isDev(req.userId);
-    if (!dev) {
-      const ids = await getUserEmpresaIds(req.userId);
-      if (!ids.includes(id)) return res.status(403).json({ ok: false, error: "Sem acesso a esta empresa." });
+    const roles = await getUserRoles(req.userId);
+    if (!isDev(roles)) return res.status(403).json({ ok: false, error: "Apenas desenvolvedor pode criar empresas." });
+
+    const e = normalizeEmpresaInput(req.body);
+    if (!e.razao_social || !e.cnpj) {
+      return res.status(400).json({ ok: false, error: "Razão social e CNPJ são obrigatórios." });
     }
+    if (!isValidCNPJ(e.cnpj)) return res.status(400).json({ ok: false, error: "CNPJ inválido." });
+    if (e.cnpj === "00000000000000") return res.status(400).json({ ok: false, error: "CNPJ reservado (GLOBAL)." });
 
-    const {
-      razao_social, nome_fantasia, email, telefone, ativa,
-      inscricao_estadual, data_abertura, capital_social,
-      natureza_juridica, situacao_cadastral, data_situacao
-    } = req.body || {};
+    // duplicidade por CNPJ (normalizado)
+    const [[dupe]] = await pool.query(
+      `SELECT id FROM empresas
+        WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ?
+        LIMIT 1`,
+      [e.cnpj]
+    );
+    if (dupe) return res.status(409).json({ ok: false, error: "Já existe empresa com este CNPJ." });
 
-    await pool.query(
-      `UPDATE empresas SET
-          razao_social = ?, nome_fantasia = ?, email = ?, telefone = ?,
-          ativa = ?, inscricao_estadual = ?, data_abertura = ?,
-          capital_social = ?, natureza_juridica = ?, situacao_cadastral = ?,
-          data_situacao = ?
-        WHERE id = ?`,
+    const [ins] = await pool.query(
+      `INSERT INTO empresas
+         (razao_social, nome_fantasia, cnpj, inscricao_estadual, data_abertura, telefone, email,
+          capital_social, natureza_juridica, situacao_cadastral, data_situacao, socios_receita, ativa)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
-        razao_social || null, nome_fantasia || null, email || null, (telefone || "").split(/[\/,;]+/)[0] || null,
-        ativa ? 1 : 0, inscricao_estadual || null, data_abertura || null,
-        Number.isFinite(+capital_social) ? +capital_social : null,
-        natureza_juridica || null, situacao_cadastral || null,
-        data_situacao || null, id
+        e.razao_social, e.nome_fantasia, e.cnpj, e.inscricao_estadual, e.data_abertura, e.telefone, e.email,
+        e.capital_social, e.natureza_juridica, e.situacao_cadastral, e.data_situacao, e.socios_receita, e.ativa ? 1 : 0
       ]
     );
 
-    res.json({ ok: true });
+    return res.json({ ok: true, id: ins.insertId });
   } catch (e) {
-    res.status(400).json({ ok: false, error: "Falha ao atualizar empresa." });
+    console.error("EMP_CREATE_ERR", e);
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao criar empresa." });
   }
 });
+
+/**
+ * PUT /api/empresas/:id
+ * Atualiza (dev ou vinculado). CNPJ NÃO é alterado aqui.
+ */
+router.put("/:id", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await ensureCanAccessEmpresa(req.userId, id);
+
+    const e = normalizeEmpresaInput(req.body);
+    // não permitir troca de CNPJ aqui
+    delete e.cnpj;
+
+    await pool.query(
+      `UPDATE empresas
+          SET razao_social = ?, nome_fantasia = ?, inscricao_estadual = ?, data_abertura = ?,
+              telefone = ?, email = ?, capital_social = ?, natureza_juridica = ?,
+              situacao_cadastral = ?, data_situacao = ?, socios_receita = ?, ativa = ?
+        WHERE id = ?`,
+      [
+        e.razao_social, e.nome_fantasia, e.inscricao_estadual, e.data_abertura,
+        e.telefone, e.email, e.capital_social, e.natureza_juridica,
+        e.situacao_cadastral, e.data_situacao, e.socios_receita, e.ativa ? 1 : 0,
+        id
+      ]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("EMP_UPDATE_ERR", e);
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao atualizar empresa." });
+  }
+});
+
+export default router;
