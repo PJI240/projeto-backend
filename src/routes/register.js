@@ -24,6 +24,7 @@ const toYYYYMMDDorNull = (s) => {
 };
 function normalizePhone(raw) {
   if (!raw) return null;
+  // pega só o primeiro número (se vier "A / B, C")
   const first = String(raw).split(/[\/,;]+/)[0];
   const digits = onlyDigits(first).slice(0, 20);
   return digits || null;
@@ -53,14 +54,14 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   if (!isValidCNPJ(cnpjNum)) throw new Error("CNPJ inválido.");
   if (cnpjNum === "00000000000000") throw new Error("CNPJ reservado (GLOBAL).");
 
-  // CORREÇÃO: Consulta simplificada e mais eficiente
+  // já existe?
   const [rows] = await conn.query(
-    "SELECT id FROM empresas WHERE cnpj = ? LIMIT 1",
-    [cnpjNum] // Já estamos passando o CNPJ sem formatação
+    "SELECT id FROM empresas WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ? LIMIT 1",
+    [cnpjNum]
   );
-  
   if (rows.length) return rows[0].id;
 
+  // normalizações e limites de tamanho conforme schema
   const razao_social       = limit(trimOrNull(empresaInput.razao_social), 255) || "";
   const nome_fantasia      = limit(trimOrNull(empresaInput.nome_fantasia), 255);
   const inscricao_estadual = limit(trimOrNull(empresaInput.inscricao_estadual), 50);
@@ -74,6 +75,7 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
   const situacao_cadastral = limit(trimOrNull(empresaInput.situacao_cadastral), 50);
   const data_situacao      = toYYYYMMDDorNull(empresaInput.data_situacao);
 
+  // JSON: aceita objeto/array ou string JSON
   let socios_receita = "[]";
   if (Array.isArray(empresaInput.socios_receita) || typeof empresaInput.socios_receita === "object") {
     try { socios_receita = JSON.stringify(empresaInput.socios_receita); } catch {}
@@ -90,10 +92,10 @@ async function getOrCreateEmpresaByCNPJ(conn, empresaInput) {
     [
       razao_social,
       nome_fantasia,
-      cnpjNum, // CORREÇÃO: Já está sem formatação
+      cnpjNum,
       inscricao_estadual,
       data_abertura,
-      telefone,
+      telefone, // <= sempre <= 20 ou null
       email,
       capital_social,
       natureza_juridica,
@@ -166,8 +168,9 @@ async function linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId) {
   );
 }
 
-/* ========= usuário × pessoa (opcional, se sua tabela existir) ========= */
+/* ========= NOVO: usuário × pessoa ========= */
 async function linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId) {
+  // Garante o vínculo 1–1 no escopo da empresa (chave única recomendada no banco)
   await conn.query(
     `INSERT IGNORE INTO usuarios_pessoas (empresa_id, usuario_id, pessoa_id)
      VALUES (?,?,?)`,
@@ -175,49 +178,14 @@ async function linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId) {
   );
 }
 
-/* ========= cargos/funcionários ========= */
-async function getOrCreateCargoByName(conn, empresaId, nomeCargo) {
-  const [rows] = await conn.query(
-    "SELECT id FROM cargos WHERE empresa_id = ? AND nome = ? LIMIT 1",
-    [empresaId, nomeCargo]
-  );
-  if (rows.length) return rows[0].id;
-
-  const [ins] = await conn.query(
-    "INSERT INTO cargos (empresa_id, nome, descricao, ativo) VALUES (?,?,?,1)",
-    [empresaId, nomeCargo, "Cargo padrão gerado automaticamente no registro"]
-  );
-  return ins.insertId;
-}
-
-async function createFuncionarioIfNotExists(conn, { empresaId, pessoaId, cargoId }) {
-  // salario_base = 0.00 conforme solicitado
-  await conn.query(
-    `INSERT IGNORE INTO funcionarios
-       (empresa_id, pessoa_id, cargo_id, regime, salario_base, valor_hora, ativo)
-     VALUES (?,?,?,?,?,?,1)`,
-    [
-      empresaId,
-      pessoaId,
-      cargoId,
-      "MENSALISTA",
-      0.00,   // <<< aqui
-      null
-    ]
-  );
-
-  const [f] = await conn.query(
-    "SELECT id FROM funcionarios WHERE empresa_id = ? AND pessoa_id = ? LIMIT 1",
-    [empresaId, pessoaId]
-  );
-  return f[0]?.id || null;
-}
-
 /* ========= rotas ========= */
 
 /**
  * POST /api/registro/completo
  * Body: { empresa:{...}, pessoa:{...}, usuario:{...} }
+ * Cria empresa (se necessário), cria pessoa, cria usuário (ativo=1),
+ * garante perfil 'administrador', vincula usuário→perfil/empresa
+ * E AGORA: vincula usuário→pessoa em usuarios_pessoas.
  */
 router.post("/completo", async (req, res) => {
   const { empresa = {}, pessoa = {}, usuario = {} } = req.body || {};
@@ -232,15 +200,7 @@ router.post("/completo", async (req, res) => {
     const perfilId  = await getOrCreatePerfilAdministrador(conn, empresaId);
 
     await linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId);
-    await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId); // se sua tabela existir
-
-    // NOVO: garante cargo "colaborador" e cria funcionário com salário 0.00
-    const cargoId = await getOrCreateCargoByName(conn, empresaId, "colaborador");
-    const funcionarioId = await createFuncionarioIfNotExists(conn, {
-      empresaId,
-      pessoaId,
-      cargoId
-    });
+    await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId); // <<< NOVO
 
     await conn.commit();
     return res.json({
@@ -249,7 +209,6 @@ router.post("/completo", async (req, res) => {
       pessoa_id: pessoaId,
       usuario_id: usuarioId,
       perfil_id: perfilId,
-      funcionario_id: funcionarioId
     });
   } catch (e) {
     if (conn) await conn.rollback();
@@ -266,45 +225,23 @@ router.post("/completo", async (req, res) => {
 
 /**
  * POST /api/registro/vincular-admin
- * Body: { empresa:{...} }  (usuário já autenticado via cookie/JWT)
+ * Body: { empresa:{...} }  (usuário já autenticado via cookie)
+ * Obs.: aqui não criamos usuarios_pessoas porque é um fluxo
+ * de “vincular nova empresa” para um usuário que pode já ter pessoa.
  */
 router.post("/vincular-admin", async (req, res) => {
-  // CORREÇÃO: Melhor tratamento de autenticação
-  let userId = req.userId || null;
-  
-  // Se não tem userId na requisição, tenta extrair do token
-  if (!userId) {
-    try {
-      const { token } = req.cookies || {};
-      if (!token) {
-        return res.status(401).json({ ok: false, error: "Não autenticado. Token não encontrado." });
-      }
-      
-      // CORREÇÃO: Verificação mais robusta do token
-      const tokenParts = token.split('.');
-      if (tokenParts.length !== 3) {
-        return res.status(401).json({ ok: false, error: "Token inválido." });
-      }
-      
-      const payload = JSON.parse(Buffer.from(tokenParts[1], "base64").toString() || "{}");
-      userId = payload.sub || payload.userId || payload.id;
-      
-      if (!userId) {
-        return res.status(401).json({ ok: false, error: "Token não contém informações de usuário." });
-      }
-    } catch (tokenError) {
-      console.error("Token parsing error:", tokenError);
-      return res.status(401).json({ ok: false, error: "Erro ao processar token de autenticação." });
-    }
-  }
-
+  const uid = req.userId || null; // se você usa middleware de auth, injete aqui
   try {
-    const { empresa = {} } = req.body || {};
-    
-    if (!empresa.cnpj) {
-      return res.status(400).json({ ok: false, error: "CNPJ da empresa é obrigatório." });
+    // fallback simples usando JWT do cookie
+    let userId = uid;
+    if (!userId) {
+      const { token } = req.cookies || {};
+      if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
+      const payload = JSON.parse(Buffer.from(token.split(".")[1] || "", "base64").toString() || "{}");
+      userId = payload.sub;
     }
 
+    const { empresa = {} } = req.body || {};
     const conn = await pool.getConnection();
     await conn.beginTransaction();
 
