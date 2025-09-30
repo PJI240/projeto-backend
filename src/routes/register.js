@@ -2,7 +2,6 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import bcrypt from "bcrypt";
-import axios from "axios";
 
 const router = Router();
 
@@ -72,31 +71,53 @@ const isValidCPF = (cpf) => {
 async function consultaCNPJnaAPI(cnpj) {
   try {
     const num = onlyDigits(cnpj);
-    const r = await axios.get(`https://www.receitaws.com.br/v1/cnpj/${num}`, {
-      timeout: 10000,
+    
+    // Usando fetch nativo em vez de axios
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch(`https://www.receitaws.com.br/v1/cnpj/${num}`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+      signal: controller.signal
     });
+    
+    clearTimeout(timeoutId);
 
-    if (r.data.status !== "OK") {
+    if (!response.ok) {
+      throw new Error(`Erro na consulta: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    if (data.status !== "OK") {
       throw new Error("Falha na consulta ReceitaWS");
     }
 
     return {
-      razao_social: r.data.nome,
-      nome_fantasia: r.data.fantasia,
-      cnpj: r.data.cnpj,
-      inscricao_estadual: r.data.inscricao_estadual || null,
-      data_abertura: r.data.abertura ? r.data.abertura.split("/").reverse().join("-") : null,
-      telefone: r.data.telefone,
-      email: r.data.email,
-      capital_social: r.data.capital_social ? 
-        parseFloat(r.data.capital_social.replace(/[^\d,.-]/g, "").replace(",", ".")) : null,
-      natureza_juridica: r.data.natureza_juridica,
-      situacao_cadastral: r.data.situacao,
-      data_situacao: r.data.data_situacao ? r.data.data_situacao.split("/").reverse().join("-") : null,
-      socios_receita: r.data.qsa || []
+      razao_social: data.nome,
+      nome_fantasia: data.fantasia,
+      cnpj: data.cnpj,
+      inscricao_estadual: data.inscricao_estadual || null,
+      data_abertura: data.abertura ? data.abertura.split("/").reverse().join("-") : null,
+      telefone: data.telefone,
+      email: data.email,
+      capital_social: data.capital_social ? 
+        parseFloat(data.capital_social.replace(/[^\d,.-]/g, "").replace(",", ".")) : null,
+      natureza_juridica: data.natureza_juridica,
+      situacao_cadastral: data.situacao,
+      data_situacao: data.data_situacao ? data.data_situacao.split("/").reverse().join("-") : null,
+      socios_receita: data.qsa || []
     };
   } catch (error) {
     console.error("ERRO_CONSULTA_CNPJ_API", error.message);
+    
+    if (error.name === 'AbortError') {
+      throw new Error("Tempo limite excedido na consulta do CNPJ");
+    }
+    
     throw new Error("Erro ao consultar dados do CNPJ na Receita Federal");
   }
 }
@@ -342,8 +363,10 @@ router.post("/completo", async (req, res) => {
     
     if (empresa.cnpj && !empresa.razao_social) {
       try {
+        console.log("Consultando CNPJ na API:", empresa.cnpj);
         const dadosAPI = await consultaCNPJnaAPI(empresa.cnpj);
         dadosEmpresa = { ...dadosAPI, ...empresa }; // Mescla dados da API com dados do formulário
+        console.log("Dados da API obtidos com sucesso");
       } catch (apiError) {
         console.warn("Consulta API falhou, usando dados manuais:", apiError.message);
         // Continua com os dados manuais se a API falhar
@@ -352,27 +375,35 @@ router.post("/completo", async (req, res) => {
 
     // PASSO 2: Cria empresa
     const empresaId = await createEmpresa(conn, dadosEmpresa);
+    console.log("Empresa criada com ID:", empresaId);
     
     // PASSO 3: Cria pessoa
     const pessoaId = await createPessoa(conn, pessoa);
+    console.log("Pessoa criada com ID:", pessoaId);
     
     // PASSO 4: Cria usuário
     const usuarioId = await createUsuario(conn, usuario, pessoa.nome);
+    console.log("Usuário criado com ID:", usuarioId);
     
     // PASSO 5: Cria perfil de administrador
     const perfilId = await getOrCreatePerfilAdministrador(conn, empresaId);
+    console.log("Perfil criado/obtido com ID:", perfilId);
 
     // PASSO 6: Faz os vínculos
     await linkUsuarioPerfil(conn, empresaId, usuarioId, perfilId);
     await linkUsuarioPessoa(conn, empresaId, usuarioId, pessoaId);
+    console.log("Vínculos criados");
 
     // PASSO 7: Cria cargo e funcionário
     const cargoId = await getOrCreateCargoByName(conn, empresaId, "colaborador");
+    console.log("Cargo criado/obtido com ID:", cargoId);
+    
     const funcionarioId = await createFuncionario(conn, {
       empresaId,
       pessoaId,
       cargoId
     });
+    console.log("Funcionário criado com ID:", funcionarioId);
 
     await conn.commit();
     
@@ -455,6 +486,7 @@ router.post("/vincular-admin", async (req, res) => {
     
     if (empresa.cnpj && !empresa.razao_social) {
       try {
+        console.log("Consultando CNPJ na API para vínculo:", empresa.cnpj);
         const dadosAPI = await consultaCNPJnaAPI(empresa.cnpj);
         dadosEmpresa = { ...dadosAPI, ...empresa };
       } catch (apiError) {
