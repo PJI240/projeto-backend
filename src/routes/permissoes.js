@@ -6,6 +6,7 @@ const router = Router();
 
 /* ======= Registro canônico ======= */
 const PERMISSIONS_REGISTRY = [
+  { codigo: "menu.apontamentos.ver", descricao: "Ver Apontamentos", escopo: "ui" },
   { codigo: "menu.dashboard.ver", descricao: "Ver Dashboard", escopo: "ui" },
   { codigo: "menu.usuarios.ver", descricao: "Ver Usuários", escopo: "ui" },
   { codigo: "menu.pessoas.ver", descricao: "Ver Pessoas", escopo: "ui" },
