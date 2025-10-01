@@ -6,21 +6,32 @@ const router = Router();
 
 /* ======= Registro canônico ======= */
 const PERMISSIONS_REGISTRY = [
-  { codigo: "menu.apontamentos.ver", descricao: "Ver Apontamentos", escopo: "ui" },
-  { codigo: "menu.dashboard.ver", descricao: "Ver Dashboard", escopo: "ui" },
-  { codigo: "menu.usuarios.ver", descricao: "Ver Usuários", escopo: "ui" },
-  { codigo: "menu.pessoas.ver", descricao: "Ver Pessoas", escopo: "ui" },
-  { codigo: "menu.empresas.ver", descricao: "Ver Empresas", escopo: "ui" },
-  { codigo: "menu.perfis.ver", descricao: "Ver Perfis", escopo: "ui" },
-  { codigo: "menu.permissoes.ver", descricao: "Ver Permissões", escopo: "ui" },
-  { codigo: "menu.cargos.ver", descricao: "Ver Cargos", escopo: "ui" },
-  { codigo: "menu.funcionarios.ver", descricao: "Ver Funcionários", escopo: "ui" },
-  { codigo: "usuarios.criar", descricao: "Criar usuário", escopo: "api" },
-  { codigo: "usuarios.editar", descricao: "Editar usuário", escopo: "api" },
-  { codigo: "usuarios.excluir", descricao: "Excluir usuário", escopo: "api" },
-  { codigo: "pessoas.criar", descricao: "Criar pessoa", escopo: "api" },
-  { codigo: "pessoas.editar", descricao: "Editar pessoa", escopo: "api" },
-  { codigo: "pessoas.excluir", descricao: "Excluir pessoa", escopo: "api" },
+  // UI (menu.*)
+  { codigo: "menu.apontamentos.ver",       descricao: "Ver Apontamentos",              escopo: "ui" },
+  { codigo: "menu.cargos.ver",             descricao: "Ver Cargos",                   escopo: "ui" },
+  { codigo: "menu.dashboard.ver",          descricao: "Ver Dashboard",                escopo: "ui" },
+  { codigo: "menu.dashboard_adm.ver",      descricao: "Ver Dashboard Admin",          escopo: "ui" },
+  { codigo: "menu.dashboard_func.ver",     descricao: "Ver Dashboard Funcionário",    escopo: "ui" },
+  { codigo: "menu.empresas.ver",           descricao: "Ver Empresas",                 escopo: "ui" },
+  { codigo: "menu.escalas.ver",            descricao: "Ver Escalas",                  escopo: "ui" },
+  { codigo: "menu.folhas.ver",             descricao: "Ver Folhas",                   escopo: "ui" },
+  { codigo: "menu.folhas-funcionarios.ver",descricao: "Ver Folhas × Funcionários",    escopo: "ui" },
+  { codigo: "menu.folhas-itens.ver",       descricao: "Ver Itens de Folha",           escopo: "ui" },
+  { codigo: "menu.funcionarios.ver",       descricao: "Ver Funcionários",             escopo: "ui" },
+  { codigo: "menu.ocorrencias.ver",        descricao: "Ver Ocorrências",              escopo: "ui" },
+  { codigo: "menu.perfis.ver",             descricao: "Ver Perfis",                   escopo: "ui" },
+  { codigo: "menu.perfis-permissoes.ver",  descricao: "Ver Perfis × Permissões",      escopo: "ui" },
+  { codigo: "menu.permissoes.ver",         descricao: "Ver Permissões",               escopo: "ui" },
+  { codigo: "menu.pessoas.ver",            descricao: "Ver Pessoas",                  escopo: "ui" },
+  { codigo: "menu.usuarios.ver",           descricao: "Ver Usuários",                 escopo: "ui" },
+
+  // API
+  { codigo: "pessoas.criar",               descricao: "Criar pessoa",                 escopo: "api" },
+  { codigo: "pessoas.editar",              descricao: "Editar pessoa",                escopo: "api" },
+  { codigo: "pessoas.excluir",             descricao: "Excluir pessoa",               escopo: "api" },
+  { codigo: "usuarios.criar",              descricao: "Criar usuário",                escopo: "api" },
+  { codigo: "usuarios.editar",             descricao: "Editar usuário",               escopo: "api" },
+  { codigo: "usuarios.excluir",            descricao: "Excluir usuário",              escopo: "api" },
 ];
 
 /* ======= Auth básico ======= */
