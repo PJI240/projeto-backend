@@ -44,18 +44,39 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 function isValidISODate(s = "") {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s));
 }
+
 function isValidTimeOrNull(s) {
-  if (s == null || s === "") return true;
-  return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(s));
+  if (s == null || s === "") {
+    console.log('DEBUG isValidTimeOrNull - Valor nulo/vazio:', s);
+    return true;
+  }
+  
+  const str = String(s).trim();
+  const isValid = /^([01]\d|2[0-3]):[0-5]\d$/.test(str);
+  
+  if (!isValid) {
+    console.log('DEBUG isValidTimeOrNull - Formato inválido:', {
+      original: s,
+      string: str,
+      length: str.length,
+      partes: str.split(':'),
+      regexTest: /^([01]\d|2[0-3]):[0-5]\d$/.test(str)
+    });
+  }
+  
+  return isValid;
 }
+
 function clampTurno(n) {
   const v = Number(n);
   return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 1;
 }
+
 function normOrigem(s = "APONTADO") {
   const t = String(s || "").toUpperCase();
   return ["APONTADO", "IMPORTADO", "AJUSTE"].includes(t) ? t : "APONTADO";
 }
+
 function minutes(hhmm) {
   if (!hhmm) return null;
   const [h, m] = String(hhmm).split(":").map(Number);
@@ -97,15 +118,6 @@ function validateHorarios(entrada, saida) {
 }
 
 /* ===================== GET /api/apontamentos ===================== */
-/**
- * Lista apontamentos do período (inclusive).
- * Query:
- *   - from=YYYY-MM-DD
- *   - to=YYYY-MM-DD
- *   - funcionario_id (opcional)
- *   - origem (opcional) APONTADO|IMPORTADO|AJUSTE
- *   - empresa_id (opcional)
- */
 router.get("/", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
@@ -146,13 +158,6 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 /* ===================== POST /api/apontamentos ===================== */
-/**
- * Body: {
- *   funcionario_id, data(YYYY-MM-DD), turno_ordem(>=1),
- *   entrada(HH:MM|null), saida(HH:MM|null), origem, obs?
- * }
- * Unicidade: (empresa_id, funcionario_id, data, turno_ordem, origem)
- */
 router.post("/", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -167,11 +172,22 @@ router.post("/", requireAuth, async (req, res) => {
       obs = null,
     } = req.body || {};
 
+    console.log('DEBUG POST - Body recebido:', req.body);
+
     if (!Number(funcionario_id) || !isValidISODate(data)) {
       return res.status(400).json({ ok: false, error: "Funcionário e data são obrigatórios." });
     }
+    
+    // VALIDAÇÃO COM DEBUG
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
-      return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)." });
+      console.error('DEBUG POST - Valores inválidos:', {
+        entrada, saida, 
+        tipos: { entrada: typeof entrada, saida: typeof saida }
+      });
+      return res.status(400).json({ 
+        ok: false, 
+        error: `Horários inválidos (HH:MM). Entrada: "${entrada}", Saída: "${saida}"` 
+      });
     }
     
     // CORREÇÃO: Usar validação flexível para turnos noturnos
@@ -234,12 +250,23 @@ router.put("/:id", requireAuth, async (req, res) => {
       obs = null,
     } = req.body || {};
 
+    console.log('DEBUG PUT - Body recebido:', req.body);
+
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
     if (!Number(funcionario_id) || !isValidISODate(data)) {
       return res.status(400).json({ ok: false, error: "Funcionário e data são obrigatórios." });
     }
+    
+    // VALIDAÇÃO COM DEBUG
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
-      return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)!!!." });
+      console.error('DEBUG PUT - Valores inválidos:', {
+        entrada, saida, 
+        tipos: { entrada: typeof entrada, saida: typeof saida }
+      });
+      return res.status(400).json({ 
+        ok: false, 
+        error: `Horários inválidos (HH:MM). Entrada: "${entrada}", Saída: "${saida}"` 
+      });
     }
     
     // CORREÇÃO: Usar validação flexível para turnos noturnos
@@ -334,10 +361,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
 });
 
 /* ===================== POST /api/apontamentos/import ===================== */
-/**
- * Body: { rows: [{ funcionario_id, data, turno_ordem, entrada, saida, origem, obs }] }
- * Importa apenas válidas; retorna resumo.
- */
 router.post("/import", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -345,6 +368,8 @@ router.post("/import", requireAuth, async (req, res) => {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     if (!rows.length) return res.status(400).json({ ok: false, error: "Nenhuma linha para importar." });
     if (rows.length > 5000) return res.status(400).json({ ok: false, error: "Limite de 5000 linhas por importação." });
+
+    console.log('DEBUG IMPORT - Dados recebidos:', { totalRows: rows.length, sample: rows.slice(0, 2) });
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -367,9 +392,14 @@ router.post("/import", requireAuth, async (req, res) => {
       let erro = "";
       if (!funcionario_id) erro = "funcionario_id vazio";
       else if (!isValidISODate(data)) erro = "data inválida (YYYY-MM-DD)";
-      else if (!isValidTimeOrNull(entrada)) erro = "entrada inválida";
-      else if (!isValidTimeOrNull(saida)) erro = "saida inválida";
-      
+      else if (!isValidTimeOrNull(entrada)) {
+        console.error('DEBUG IMPORT - Entrada inválida na linha', i, ':', entrada);
+        erro = "entrada inválida";
+      }
+      else if (!isValidTimeOrNull(saida)) {
+        console.error('DEBUG IMPORT - Saída inválida na linha', i, ':', saida);
+        erro = "saida inválida";
+      }
       // CORREÇÃO: Usar validação flexível
       else if (entrada && saida) {
         const validacao = validateHorarios(entrada, saida);
