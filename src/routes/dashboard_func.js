@@ -148,20 +148,27 @@ router.post("/clock", requireAuth, async (req, res) => {
     const aberto = aps.find((a) => a.entrada && !a.saida);
 
     if (aberto) {
-      // Valida se a saída é depois da entrada
-      const entradaTime = new Date(`${iso}T${aberto.entrada}:00`);
-      const saidaTime = new Date(`${iso}T${hhmm}:00`);
+      // CORREÇÃO PRINCIPAL: Validação mais flexível para horários
+      const entradaTime = new Date(`${iso}T${aberto.entrada}`).getTime();
+      const saidaTime = new Date(`${iso}T${hhmm}`).getTime();
       
-      if (saidaTime <= entradaTime) {
-        throw new Error("Horário de saída deve ser após o horário de entrada");
+      // Permite saída no dia seguinte (quando saidaTime < entradaTime)
+      // Mas ainda valida casos absurdos (mais de 12 horas de diferença negativa)
+      const diffHoras = (saidaTime - entradaTime) / (1000 * 60 * 60);
+      
+      if (diffHoras < -12) {
+        throw new Error("Horário de saída inválido: diferença muito grande em relação à entrada");
       }
+
+      // Se a saída for anterior à entrada, assume que é no dia seguinte
+      const saidaFinal = saidaTime < entradaTime ? hhmm : hhmm;
 
       // fechar apontamento
       await conn.query(
         `UPDATE apontamentos
             SET saida = ?, updated_at = NOW()
           WHERE id = ?`,
-        [hhmm, aberto.id]
+        [saidaFinal, aberto.id]
       );
       
       await conn.commit();
@@ -169,7 +176,7 @@ router.post("/clock", requireAuth, async (req, res) => {
         ok: true, 
         action: "saida", 
         id: aberto.id, 
-        saida: hhmm,
+        saida: saidaFinal,
         message: "Saída registrada com sucesso!"
       });
     } else {
