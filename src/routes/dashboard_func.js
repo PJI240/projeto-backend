@@ -48,7 +48,6 @@ function nowBR() {
   return { iso, time, date: d };
 }
 
-/* ========== resolve funcionário vinculado ao usuário para a empresa ========== */
 async function getFuncionarioDoUsuario(empresaId, userId) {
   const [rows] = await pool.query(
     `
@@ -57,9 +56,9 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
            c.nome  AS cargo_nome
       FROM usuarios_pessoas up
       JOIN pessoas p       ON p.id = up.pessoa_id
-      JOIN funcionarios f  ON f.pessoa_id = p.id AND f.empresa_id = up.empresa_id
+      JOIN funcionarios f  ON f.pessoa_id = p.id AND f.empresa_id = ?
       LEFT JOIN cargos c   ON c.id = f.cargo_id
-     WHERE up.empresa_id = ? AND up.usuario_id = ?
+     WHERE up.usuario_id = ?
      LIMIT 1
     `,
     [empresaId, userId]
