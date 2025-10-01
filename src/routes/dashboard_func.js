@@ -206,8 +206,8 @@ router.post("/clock", requireAuth, async (req, res) => {
 
       const [ins] = await conn.query(
         `INSERT INTO apontamentos
-           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,NULL,NOW(),NOW())`,
+           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs)
+         VALUES (?,?,?,?,?,?,?,NULL)`,
         [empresaId, func.id, iso, maxTurno + 1, hhmm, null, "APONTADO"]
       );
 
