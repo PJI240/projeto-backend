@@ -5,29 +5,47 @@ import jwt from "jsonwebtoken";
 
 const router = Router();
 
-/* ======= Registro canônico ======= */
+/* =========================================================
+   Registro canônico (mantido)
+   ========================================================= */
 const PERMISSIONS_REGISTRY = [
-  { codigo: "menu.dashboard.ver", descricao: "Ver Dashboard", escopo: "ui" },
-  { codigo: "menu.usuarios.ver", descricao: "Ver Usuários", escopo: "ui" },
-  { codigo: "menu.pessoas.ver", descricao: "Ver Pessoas", escopo: "ui" },
-  { codigo: "menu.empresas.ver", descricao: "Ver Empresas", escopo: "ui" },
-  { codigo: "menu.perfis.ver", descricao: "Ver Perfis", escopo: "ui" },
-  { codigo: "menu.permissoes.ver", descricao: "Ver Permissões", escopo: "ui" },
-  { codigo: "menu.cargos.ver", descricao: "Ver Cargos", escopo: "ui" },
-  { codigo: "menu.funcionarios.ver", descricao: "Ver Funcionários", escopo: "ui" },
-  { codigo: "usuarios.criar", descricao: "Criar usuário", escopo: "api" },
-  { codigo: "usuarios.editar", descricao: "Editar usuário", escopo: "api" },
-  { codigo: "usuarios.excluir", descricao: "Excluir usuário", escopo: "api" },
-  { codigo: "pessoas.criar", descricao: "Criar pessoa", escopo: "api" },
-  { codigo: "pessoas.editar", descricao: "Editar pessoa", escopo: "api" },
-  { codigo: "pessoas.excluir", descricao: "Excluir pessoa", escopo: "api" },
+  { codigo: "menu.dashboard.ver",     descricao: "Ver Dashboard",        escopo: "ui" },
+  { codigo: "menu.usuarios.ver",      descricao: "Ver Usuários",         escopo: "ui" },
+  { codigo: "menu.pessoas.ver",       descricao: "Ver Pessoas",          escopo: "ui" },
+  { codigo: "menu.empresas.ver",      descricao: "Ver Empresas",         escopo: "ui" },
+  { codigo: "menu.perfis.ver",        descricao: "Ver Perfis",           escopo: "ui" },
+  { codigo: "menu.permissoes.ver",    descricao: "Ver Permissões",       escopo: "ui" },
+  { codigo: "menu.cargos.ver",        descricao: "Ver Cargos",           escopo: "ui" },
+  { codigo: "menu.funcionarios.ver",  descricao: "Ver Funcionários",     escopo: "ui" },
+
+  { codigo: "usuarios.criar",         descricao: "Criar usuário",        escopo: "api" },
+  { codigo: "usuarios.editar",        descricao: "Editar usuário",       escopo: "api" },
+  { codigo: "usuarios.excluir",       descricao: "Excluir usuário",      escopo: "api" },
+
+  { codigo: "pessoas.criar",          descricao: "Criar pessoa",         escopo: "api" },
+  { codigo: "pessoas.editar",         descricao: "Editar pessoa",        escopo: "api" },
+  { codigo: "pessoas.excluir",        descricao: "Excluir pessoa",       escopo: "api" },
 ];
 
-/* ======= Auth básico ======= */
+/* =========================================================
+   Auth básico (AGORA aceita Cookie OU Authorization: Bearer)
+   ========================================================= */
 function requireAuth(req, res, next) {
   try {
-    const { token } = req.cookies || {};
-    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
+    // 1) Cookie "token"
+    let token = req.cookies?.token;
+
+    // 2) Fallback: Authorization: Bearer <JWT>
+    if (!token) {
+      const h = String(req.headers.authorization || "");
+      const m = h.match(/^Bearer\s+(.+)$/i);
+      if (m) token = m[1];
+    }
+
+    if (!token) {
+      return res.status(401).json({ ok: false, error: "Não autenticado." });
+    }
+
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     req.userId = payload.sub;
     next();
@@ -36,7 +54,9 @@ function requireAuth(req, res, next) {
   }
 }
 
-/* ======= Util: resolve empresas do usuário ======= */
+/* =========================================================
+   Helpers empresa/escopo
+   ========================================================= */
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `SELECT empresa_id
@@ -44,7 +64,7 @@ async function getUserEmpresaIds(userId) {
       WHERE usuario_id = ? AND ativo = 1`,
     [userId]
   );
-  return rows.map(r => r.empresa_id);
+  return rows.map((r) => r.empresa_id);
 }
 
 async function resolveEmpresaContext(userId, empresaIdQuery) {
@@ -58,30 +78,30 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
   return empresas[0];
 }
 
-/* ======= Migração automática da tabela ======= */
+/* =========================================================
+   Migração leve (mantida) — add colunas e UNIQUE(codigo)
+   ========================================================= */
 async function ensurePermissoesShape() {
   const [cols] = await pool.query(`SHOW COLUMNS FROM permissoes`);
-  const names = new Set(cols.map(c => c.Field));
+  const names = new Set(cols.map((c) => c.Field));
 
   const alterParts = [];
-  if (!names.has("descricao")) {
-    alterParts.push(`ADD COLUMN descricao VARCHAR(255) NULL`);
-  }
-  if (!names.has("escopo")) {
-    alterParts.push(`ADD COLUMN escopo VARCHAR(50) NULL`);
-  }
+  if (!names.has("descricao")) alterParts.push(`ADD COLUMN descricao VARCHAR(255) NULL`);
+  if (!names.has("escopo")) alterParts.push(`ADD COLUMN escopo VARCHAR(50) NULL`);
   if (alterParts.length) {
     await pool.query(`ALTER TABLE permissoes ${alterParts.join(", ")}`);
   }
 
   const [idx] = await pool.query(`SHOW INDEX FROM permissoes`);
-  const hasUniqueCodigo = idx.some(r => r.Column_name === "codigo" && r.Non_unique === 0);
+  const hasUniqueCodigo = idx.some((r) => r.Column_name === "codigo" && r.Non_unique === 0);
   if (!hasUniqueCodigo) {
     await pool.query(`ALTER TABLE permissoes ADD UNIQUE KEY uq_permissoes_codigo (codigo)`);
   }
 }
 
-/* ======= GET /api/permissoes ======= */
+/* =========================================================
+   GET /api/permissoes — lista todas (mantido)
+   ========================================================= */
 router.get("/", requireAuth, async (_req, res) => {
   try {
     await ensurePermissoesShape();
@@ -97,97 +117,108 @@ router.get("/", requireAuth, async (_req, res) => {
   }
 });
 
-/* ======= GET /api/permissoes/minhas =======
-   Query:
-     - empresa_id (opcional; se omitido, usa a 1ª do usuário)
-     - principal=1 (opcional; se presente/1, usa somente o perfil_principal de empresas_usuarios)
-     - perfil_id=ID (opcional; força pegar permissões deste perfil específico)
-*/
+/* =========================================================
+   GET /api/permissoes/minhas
+   - empresa_id (opcional) → valida vínculo
+   - principal=1 → usa apenas perfil_principal (empresas_usuarios)
+   - perfil_id=ID → força pegar as permissões deste perfil
+   - caso nenhum filtro: união de TODOS perfis do usuário na empresa
+   ========================================================= */
 router.get("/minhas", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const principalOnly = String(req.query.principal || "") === "1";
     const perfilIdFilter = Number(req.query.perfil_id || 0) || null;
 
-    // 1) PERFIL ESPECÍFICO (perfil_id=...)
+    // 1) Permissões de um perfil específico
     if (perfilIdFilter) {
       const [rows] = await pool.query(
-        `
-        SELECT DISTINCT pm.codigo
-          FROM perfis_permissoes pp
-          JOIN permissoes pm  ON pm.id = pp.permissao_id
-         WHERE pp.empresa_id = ? AND pp.perfil_id = ?
-        `,
+        `SELECT DISTINCT pm.codigo
+           FROM perfis_permissoes pp
+           JOIN permissoes pm ON pm.id = pp.permissao_id
+          WHERE pp.empresa_id = ? AND pp.perfil_id = ?`,
         [empresaId, perfilIdFilter]
       );
-      return res.json({ ok: true, scope: "perfil_id", perfil_id: perfilIdFilter, codes: rows.map(r => r.codigo) });
+      return res.json({
+        ok: true,
+        scope: "perfil_id",
+        perfil_id: perfilIdFilter,
+        codes: rows.map((r) => r.codigo),
+      });
     }
 
-    // 2) APENAS PERFIL PRINCIPAL (empresas_usuarios.perfil_principal)
+    // 2) Somente perfil_principal do usuário (texto → id de perfil)
     if (principalOnly) {
-      // resolve o perfil principal textual -> id do perfil na empresa
       const [[eu]] = await pool.query(
-        `
-        SELECT eu.perfil_principal
-          FROM empresas_usuarios eu
-         WHERE eu.usuario_id = ? AND eu.empresa_id = ? AND eu.ativo = 1
-         LIMIT 1
-        `,
+        `SELECT perfil_principal
+           FROM empresas_usuarios
+          WHERE usuario_id = ? AND empresa_id = ? AND ativo = 1
+          LIMIT 1`,
         [req.userId, empresaId]
       );
-      if (!eu) {
+      if (!eu?.perfil_principal) {
         return res.json({ ok: true, scope: "principal", codes: [] });
       }
 
       const [[perf]] = await pool.query(
-        `
-        SELECT p.id
-          FROM perfis p
-         WHERE p.empresa_id = ?
-           AND LOWER(p.nome) = LOWER(?)
-         LIMIT 1
-        `,
-        [empresaId, eu.perfil_principal || ""]
+        `SELECT id
+           FROM perfis
+          WHERE empresa_id = ?
+            AND LOWER(nome) = LOWER(?)
+          LIMIT 1`,
+        [empresaId, eu.perfil_principal]
       );
-      if (!perf) {
+      if (!perf?.id) {
         return res.json({ ok: true, scope: "principal", codes: [] });
       }
 
       const [rows] = await pool.query(
-        `
-        SELECT DISTINCT pm.codigo
-          FROM perfis_permissoes pp
-          JOIN permissoes pm  ON pm.id = pp.permissao_id
-         WHERE pp.empresa_id = ? AND pp.perfil_id = ?
-        `,
+        `SELECT DISTINCT pm.codigo
+           FROM perfis_permissoes pp
+           JOIN permissoes pm ON pm.id = pp.permissao_id
+          WHERE pp.empresa_id = ? AND pp.perfil_id = ?`,
         [empresaId, perf.id]
       );
-      return res.json({ ok: true, scope: "principal", perfil_id: perf.id, codes: rows.map(r => r.codigo) });
+      return res.json({
+        ok: true,
+        scope: "principal",
+        perfil_id: perf.id,
+        codes: rows.map((r) => r.codigo),
+      });
     }
 
-    // 3) PADRÃO: UNIÃO DE TODOS PERFIS QUE O USUÁRIO POSSUI NA EMPRESA
+    // 3) União de TODOS os perfis do usuário na empresa
     const [rows] = await pool.query(
-      `
-      SELECT DISTINCT pm.codigo
-        FROM usuarios_perfis up
-        JOIN perfis_permissoes pp ON pp.perfil_id = up.perfil_id AND pp.empresa_id = up.empresa_id
-        JOIN permissoes pm        ON pm.id = pp.permissao_id
-       WHERE up.usuario_id = ? AND up.empresa_id = ?
-      `,
+      `SELECT DISTINCT pm.codigo
+         FROM usuarios_perfis up
+         JOIN perfis_permissoes pp
+           ON pp.perfil_id = up.perfil_id
+          AND pp.empresa_id = up.empresa_id
+         JOIN permissoes pm
+           ON pm.id = pp.permissao_id
+        WHERE up.usuario_id = ? AND up.empresa_id = ?`,
       [req.userId, empresaId]
     );
-    return res.json({ ok: true, scope: "all_profiles", codes: rows.map(r => r.codigo) });
+
+    return res.json({
+      ok: true,
+      scope: "all_profiles",
+      codes: rows.map((r) => r.codigo),
+    });
   } catch (e) {
     console.error("PERMISSOES_MINHAS_ERR", e);
     return res.status(400).json({ ok: false, error: "Falha ao obter permissões." });
   }
 });
 
-/* ======= POST /api/permissoes/sync ======= */
+/* =========================================================
+   POST /api/permissoes/sync — upsert canônico (mantido)
+   ========================================================= */
 router.post("/sync", requireAuth, async (_req, res) => {
   let conn;
   try {
     await ensurePermissoesShape();
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
