@@ -1,3 +1,4 @@
+// src/routes/permissoes.js
 import { Router } from "express";
 import { pool } from "../db.js";
 import jwt from "jsonwebtoken";
@@ -27,42 +28,55 @@ function requireAuth(req, res, next) {
   try {
     const { token } = req.cookies || {};
     if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
-    jwt.verify(token, process.env.JWT_SECRET);
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = payload.sub;
     next();
   } catch {
     return res.status(401).json({ ok: false, error: "Sessão inválida." });
   }
 }
 
-/* ======= Migração automática da tabela =======
-   - Adiciona colunas 'descricao' e 'escopo' se não existirem
-   - Garante UNIQUE(codigo)
-*/
+/* ======= Util: resolve empresas do usuário ======= */
+async function getUserEmpresaIds(userId) {
+  const [rows] = await pool.query(
+    `SELECT empresa_id
+       FROM empresas_usuarios
+      WHERE usuario_id = ? AND ativo = 1`,
+    [userId]
+  );
+  return rows.map(r => r.empresa_id);
+}
+
+async function resolveEmpresaContext(userId, empresaIdQuery) {
+  const empresas = await getUserEmpresaIds(userId);
+  if (!empresas.length) throw new Error("Usuário sem empresa vinculada.");
+  if (empresaIdQuery) {
+    const id = Number(empresaIdQuery);
+    if (empresas.includes(id)) return id;
+    throw new Error("Empresa não autorizada.");
+  }
+  return empresas[0];
+}
+
+/* ======= Migração automática da tabela ======= */
 async function ensurePermissoesShape() {
-  // Descobre colunas atuais
   const [cols] = await pool.query(`SHOW COLUMNS FROM permissoes`);
   const names = new Set(cols.map(c => c.Field));
 
   const alterParts = [];
-
   if (!names.has("descricao")) {
     alterParts.push(`ADD COLUMN descricao VARCHAR(255) NULL`);
   }
   if (!names.has("escopo")) {
-    // depois de descricao se possível (não é obrigatório)
     alterParts.push(`ADD COLUMN escopo VARCHAR(50) NULL`);
   }
-
   if (alterParts.length) {
     await pool.query(`ALTER TABLE permissoes ${alterParts.join(", ")}`);
   }
 
-  // Garante UNIQUE em codigo
   const [idx] = await pool.query(`SHOW INDEX FROM permissoes`);
   const hasUniqueCodigo = idx.some(r => r.Column_name === "codigo" && r.Non_unique === 0);
   if (!hasUniqueCodigo) {
-    // remove índice duplicado se houver e cria unique
-    // (MySQL permite múltiplos índices no mesmo campo; aqui só garantimos o UNIQUE)
     await pool.query(`ALTER TABLE permissoes ADD UNIQUE KEY uq_permissoes_codigo (codigo)`);
   }
 }
@@ -83,14 +97,34 @@ router.get("/", requireAuth, async (_req, res) => {
   }
 });
 
-/* ======= POST /api/permissoes/sync =======
-   Upsert com base no registro canônico.
-*/
+/* ======= GET /api/permissoes/minhas ======= */
+router.get("/minhas", requireAuth, async (req, res) => {
+  try {
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+
+    const [rows] = await pool.query(
+      `
+      SELECT DISTINCT pm.codigo
+        FROM usuarios_perfis up
+        JOIN perfis_permissoes pp ON pp.perfil_id = up.perfil_id AND pp.empresa_id = up.empresa_id
+        JOIN permissoes pm        ON pm.id = pp.permissao_id
+       WHERE up.usuario_id = ? AND up.empresa_id = ?
+      `,
+      [req.userId, empresaId]
+    );
+
+    return res.json({ ok: true, codes: rows.map(r => r.codigo) });
+  } catch (e) {
+    console.error("PERMISSOES_MINHAS_ERR", e);
+    return res.status(400).json({ ok: false, error: "Falha ao obter permissões." });
+  }
+});
+
+/* ======= POST /api/permissoes/sync ======= */
 router.post("/sync", requireAuth, async (_req, res) => {
   let conn;
   try {
     await ensurePermissoesShape();
-
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
