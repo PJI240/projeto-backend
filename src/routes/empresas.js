@@ -131,26 +131,14 @@ async function ensureCanAccessEmpresa(userId, empresaId) {
 }
 
 /* =========================================================
-   1) Consulta CNPJ (pública para o fluxo de cadastro)
+   1) Consulta CNPJ (pública) — checa banco e PROXY para /api/registro/consulta-cnpj
    ========================================================= */
-
-// helper: fetch com timeout
-async function fetchJson(url, { timeoutMs = 12000 } = {}) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { signal: ac.signal });
-    const data = await r.json().catch(() => null);
-    return { ok: r.ok, status: r.status, data };
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // 🔓 PÚBLICA — não usa requireAuth
 router.post("/consulta-cnpj", async (req, res) => {
   try {
-    const num = onlyDigits(req.body?.cnpj);
+    const raw = req.body?.cnpj;
+    const num = onlyDigits(raw);
     if (num.length !== 14) {
       return res.status(400).json({ ok: false, error: "CNPJ inválido (14 dígitos)." });
     }
@@ -158,40 +146,43 @@ router.post("/consulta-cnpj", async (req, res) => {
       return res.status(400).json({ ok: false, error: "CNPJ reservado ao sistema (GLOBAL)." });
     }
 
-    const { ok, status, data } = await fetchJson(`https://www.receitaws.com.br/v1/cnpj/${num}`);
-    if (!ok || !data || data.status !== "OK") {
-      return res.status(502).json({
+    // 1) Verifica no banco ANTES de chamar a API interna
+    const [rows] = await pool.query(
+      `SELECT id, razao_social, cnpj
+         FROM empresas
+        WHERE REPLACE(REPLACE(REPLACE(cnpj,'/',''),'.',''),'-','') = ?
+           OR cnpj = ?
+        LIMIT 1`,
+      [num, raw]
+    );
+    if (rows.length) {
+      const ja = rows[0];
+      return res.status(409).json({
         ok: false,
-        error: "Falha ao consultar a Receita (tente novamente em instantes).",
-        upstream: status,
+        code: "already_registered",
+        error: "Sua empresa já tem cadastro, procure o seu administrador.",
+        empresa_id: ja.id,
+        razao_social: ja.razao_social
       });
     }
 
-    const d = data;
-    const empresa = {
-      razao_social:       d.nome || "",
-      nome_fantasia:      d.fantasia || "",
-      cnpj:               num,
-      inscricao_estadual: null,
-      data_abertura:      d.abertura ? d.abertura.split("/").reverse().join("-") : null,
-      telefone:           d.telefone || "",
-      email:              d.email || "",
-      capital_social:     (() => {
-        const raw = String(d.capital_social ?? "").replace(/[^\d,.-]/g, "").replace(",", ".");
-        const val = parseFloat(raw);
-        return Number.isFinite(val) ? val : null;
-      })(),
-      natureza_juridica:  d.natureza_juridica || "",
-      situacao_cadastral: d.situacao || "",
-      data_situacao:      d.data_situicao ? d.data_situicao.split("/").reverse().join("-") : null,
-      socios_receita:     JSON.stringify(d.qsa || []),
-    };
+    // 2) Não existe? Encaminha para a SUA API interna (não chama ReceitaWS aqui)
+    const SELF_ORIGIN =
+      process.env.SELF_ORIGIN ||
+      `http://127.0.0.1:${process.env.PORT || 4000}`;
 
-    return res.json({ ok: true, empresa });
+    const resp = await fetch(`${SELF_ORIGIN}/api/registro/consulta-cnpj`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // público — sem cookies
+      body: JSON.stringify({ cnpj: num }),
+    });
+
+    const data = await resp.json().catch(() => null);
+    return res.status(resp.status).json(data ?? { ok: false, error: "Falha na consulta interna." });
   } catch (e) {
-    console.error("CNPJ_API_ERR", e?.message);
-    const msg = /abort/i.test(String(e?.message || "")) ? "Tempo de consulta esgotado." : "Erro interno na consulta de CNPJ.";
-    return res.status(500).json({ ok: false, error: msg });
+    console.error("EMPRESAS_CONSULTA_CNPJ_PROXY_ERR", e?.message || e);
+    return res.status(500).json({ ok: false, error: "Erro ao consultar CNPJ." });
   }
 });
 
@@ -329,7 +320,7 @@ router.put("/:id", async (req, res) => {
       [
         e.razao_social, e.nome_fantasia, e.inscricao_estadual, e.data_abertura,
         e.telefone, e.email, e.capital_social, e.natureza_juridica,
-        e.situacao_cadastral, e.data_situicao || e.data_situacao, e.socios_receita, e.ativa ? 1 : 0,
+        e.situacao_cadastral, e.data_situacao, e.socios_receita, e.ativa ? 1 : 0,
         id
       ]
     );
