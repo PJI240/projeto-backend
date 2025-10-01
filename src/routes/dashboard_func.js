@@ -41,17 +41,15 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 
 const pad2 = (n) => String(n).padStart(2, "0");
 function nowBR() {
-  // usa horário do servidor; se precisar, troque para fuso específico
   const d = new Date();
   const iso = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-  const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  return { iso, hhmm, date: d };
+  // CORREÇÃO: Garantir formato HH:MM:SS para compatibilidade com TIME do MySQL
+  const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  return { iso, time, date: d };
 }
 
 /* ========== resolve funcionário vinculado ao usuário para a empresa ========== */
-/** retorna: { id, pessoa_nome, cargo_nome } */
 async function getFuncionarioDoUsuario(empresaId, userId) {
-  // vinculo 1:1 via usuarios_pessoas
   const [rows] = await pool.query(
     `
     SELECT f.id,
@@ -70,19 +68,6 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
 }
 
 /* ========== GET /api/dashboard_func/hoje ========== */
-/**
- * Retorna dados agregados para a tela do colaborador.
- * Query opcional: ?empresa_id=...
- * Resposta:
- * {
- *   ok, empresa_id,
- *   funcionario: { id, pessoa_nome, cargo_nome },
- *   data: "YYYY-MM-DD",
- *   escala: [{id, entrada, saida, turno_ordem}],
- *   apontamentos: [{id, turno_ordem, entrada, saida, origem}],
- *   estado: "TRABALHANDO" | "FORA"
- * }
- */
 router.get("/hoje", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
@@ -130,13 +115,6 @@ router.get("/hoje", requireAuth, async (req, res) => {
 });
 
 /* ========== POST /api/dashboard_func/clock ========== */
-/**
- * Bater ponto (toggle).
- * Body opcional: { empresa_id } (se tiver múltiplas empresas).
- * Lógica:
- *  - se houver apontamento aberto hoje → fecha com saída agora
- *  - senão → cria apontamento com entrada agora (turno_ordem = máx + 1)
- */
 router.post("/clock", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -144,7 +122,7 @@ router.post("/clock", requireAuth, async (req, res) => {
     const func = await getFuncionarioDoUsuario(empresaId, req.userId);
     if (!func) return res.status(404).json({ ok: false, error: "Funcionário não encontrado para este usuário." });
 
-    const { iso, hhmm } = nowBR();
+    const { iso, time } = nowBR(); // CORREÇÃO: usar 'time' ao invés de 'hhmm'
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -161,38 +139,61 @@ router.post("/clock", requireAuth, async (req, res) => {
     const aberto = aps.find((a) => a.entrada && !a.saida);
 
     if (aberto) {
-      // fechar
+      // CORREÇÃO: Validar se a hora de saída é posterior à entrada
+      if (aberto.entrada && time <= aberto.entrada) {
+        await conn.rollback();
+        return res.status(400).json({ 
+          ok: false, 
+          error: "Hora de saída deve ser posterior à hora de entrada." 
+        });
+      }
+
+      // CORREÇÃO: Usar transação para garantir consistência
       await conn.query(
         `UPDATE apontamentos
-            SET saida = ?
+            SET saida = ?, atualizado_em = NOW()
           WHERE id = ?`,
-        [hhmm, aberto.id]
+        [time, aberto.id]
       );
+      
       await conn.commit();
-      return res.json({ ok: true, action: "saida", id: aberto.id, saida: hhmm });
+      return res.json({ ok: true, action: "saida", id: aberto.id, saida: time });
     } else {
-      // novo
+      // novo apontamento de entrada
       const maxTurno = aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
 
-      // regra de unicidade (empresa_id, funcionario_id, data, turno_ordem, origem)
-      // aqui usamos origem = APONTADO
       const [ins] = await conn.query(
         `INSERT INTO apontamentos
-           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs)
-         VALUES (?,?,?,?,?,?,?,NULL)`,
-        [empresaId, func.id, iso, maxTurno + 1, hhmm, null, "APONTADO"]
+           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs, criado_em, atualizado_em)
+         VALUES (?,?,?,?,?,?,?,NULL,NOW(),NOW())`,
+        [empresaId, func.id, iso, maxTurno + 1, time, null, "APONTADO"]
       );
 
       await conn.commit();
-      return res.json({ ok: true, action: "entrada", id: ins.insertId, entrada: hhmm, turno_ordem: maxTurno + 1 });
+      return res.json({ 
+        ok: true, 
+        action: "entrada", 
+        id: ins.insertId, 
+        entrada: time, 
+        turno_ordem: maxTurno + 1 
+      });
     }
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("DASH_FUNC_CLOCK_ERR", e);
     const msg = String(e?.message || "");
-    if (/Duplicate entry/i.test(msg)) {
-      return res.status(409).json({ ok: false, error: "Conflito de duplicidade: já existe um registro igual." });
+    
+    // CORREÇÃO: Melhor tratamento de erros específicos
+    if (/invalid time|hour|minute|second/i.test(msg)) {
+      return res.status(400).json({ ok: false, error: "Formato de hora inválido." });
     }
+    if (/Duplicate entry/i.test(msg)) {
+      return res.status(409).json({ ok: false, error: "Já existe um registro com esses dados." });
+    }
+    if (/check constraint|constraint fails/i.test(msg)) {
+      return res.status(400).json({ ok: false, error: "Regra de negócio violada: " + msg });
+    }
+    
     return res.status(400).json({ ok: false, error: msg || "Falha ao registrar ponto." });
   } finally {
     if (conn) conn.release();
