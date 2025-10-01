@@ -5,7 +5,6 @@ import { pool } from "../db.js";
 const router = Router();
 
 /* ========== helpers comuns ========== */
-
 function requireAuth(req, res, next) {
   try {
     const { token } = req.cookies || {};
@@ -42,16 +41,14 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 const pad2 = (n) => String(n).padStart(2, "0");
 function nowBR() {
   const d = new Date();
-  // Ajusta para o fuso horário de Brasília (UTC-3)
   const offset = -3 * 60; // UTC-3 em minutos
   d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + offset);
-
   const iso = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
   const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   return { iso, hhmm, date: d };
 }
 
-/* ========= funcionário do usuário na empresa (via usuarios_pessoas + empresas_usuarios) ========= */
+/* ========= funcionário do usuário na empresa ========= */
 async function getFuncionarioDoUsuario(empresaId, userId) {
   const [rows] = await pool.query(
     `
@@ -76,7 +73,6 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
     `,
     [userId, empresaId]
   );
-
   return rows[0] || null;
 }
 
@@ -137,14 +133,13 @@ router.post("/clock", requireAuth, async (req, res) => {
 
     const { iso, hhmm } = nowBR();
 
+    // valida HH:MM
+    if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(hhmm)) {
+      return res.status(400).json({ ok: false, error: `Formato de hora inválido: ${hhmm}` });
+    }
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
-
-    // Validação simples do formato de hora HH:MM
-    const timeRegex = /^([01]?\d|2[0-3]):[0-5]\d$/;
-    if (!timeRegex.test(hhmm)) {
-      throw new Error(`Formato de hora inválido: ${hhmm}`);
-    }
 
     // apontamentos de hoje
     const [aps] = await conn.query(
@@ -158,41 +153,32 @@ router.post("/clock", requireAuth, async (req, res) => {
     const aberto = aps.find((a) => a.entrada && !a.saida);
 
     if (aberto) {
-      // Fechando turno aberto
+      // fechar turno aberto
       const entradaTime = new Date(`${iso}T${aberto.entrada}:00`).getTime();
       const saidaTime   = new Date(`${iso}T${hhmm}:00`).getTime();
-      const diffHoras   = (saidaTime - entradaTime) / 36e5; // ms -> horas
+      const diffHoras   = (saidaTime - entradaTime) / 36e5; // horas
 
       if (diffHoras < -12) {
         throw new Error("Horário de saída inválido: diferença muito grande em relação à entrada.");
       }
 
-      const saidaFinal = hhmm; // se for virada, regra do seu backend geral cuida em outra tela
-
       await conn.query(
         `UPDATE apontamentos
-            SET saida = ?, updated_at = NOW()
+            SET saida = ?
           WHERE id = ?`,
-        [saidaFinal, aberto.id] // <<< AQUI estava o bug: faltava 'aberto.id'
+        [hhmm, aberto.id] // ✅ agora sem updated_at
       );
 
       await conn.commit();
-      return res.json({
-        ok: true,
-        action: "saida",
-        id: aberto.id,
-        saida: saidaFinal,
-        message: "Saída registrada com sucesso!",
-      });
+      return res.json({ ok: true, action: "saida", id: aberto.id, saida: hhmm });
     } else {
-      // Novo turno
-      const maxTurno =
-        aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
+      // novo turno
+      const maxTurno = aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
 
-      // Checagem de duplicidade (chave lógica)
+      // checa duplicidade lógica
       const [existing] = await conn.query(
         `SELECT id
-           FROM apontamentos 
+           FROM apontamentos
           WHERE empresa_id = ? AND funcionario_id = ? AND data = ? AND turno_ordem = ? AND origem = ?`,
         [empresaId, func.id, iso, maxTurno + 1, "APONTADO"]
       );
@@ -214,7 +200,6 @@ router.post("/clock", requireAuth, async (req, res) => {
         id: ins.insertId,
         entrada: hhmm,
         turno_ordem: maxTurno + 1,
-        message: "Entrada registrado com sucesso!",
       });
     }
   } catch (e) {
