@@ -215,15 +215,92 @@ async function createFuncionarioIfNotExists(conn, { empresaId, pessoaId, cargoId
   return f[0]?.id || null;
 }
 
-/* ========= rotas ========= */
+/* ========= ROTAS ========= */
+
+/**
+ * 🔓 PÚBLICA
+ * POST /api/registro/consulta-cnpj
+ * - Valida CNPJ
+ * - Consulta ReceitaWS
+ * - Mapeia para o formato do seu schema (NÃO grava no banco)
+ */
+router.post("/consulta-cnpj", async (req, res) => {
+  try {
+    const raw = req.body?.cnpj || "";
+    const num = onlyDigits(raw);
+
+    if (num.length !== 14) {
+      return res.status(400).json({ ok: false, error: "CNPJ inválido (14 dígitos)." });
+    }
+    if (num === "00000000000000") {
+      return res.status(400).json({ ok: false, error: "CNPJ reservado ao sistema (GLOBAL)." });
+    }
+
+    // timeout manual de 12s
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 12000);
+    let resp, data;
+    try {
+      resp = await fetch(`https://www.receitaws.com.br/v1/cnpj/${num}`, { signal: ac.signal });
+      data = await resp.json().catch(() => null);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!resp?.ok || !data || data.status !== "OK") {
+      return res.status(502).json({
+        ok: false,
+        error: "Falha ao consultar a Receita (tente novamente em instantes).",
+        upstream: resp?.status || null,
+      });
+    }
+
+    const d = data;
+    const empresa = {
+      razao_social:       d.nome || "",
+      nome_fantasia:      d.fantasia || "",
+      cnpj:               num, // normalizado (14 dígitos)
+      inscricao_estadual: null,
+      data_abertura:      d.abertura ? d.abertura.split("/").reverse().join("-") : null,
+      telefone:           d.telefone || "",
+      email:              d.email || "",
+      capital_social:     (() => {
+        // remove milhar e ajusta decimal
+        const rawCap = String(d.capital_social ?? "")
+          .replace(/[^\d,.-]/g, "")
+          .replace(/\./g, "")
+          .replace(",", ".");
+        const val = parseFloat(rawCap);
+        return Number.isFinite(val) ? val : null;
+      })(),
+      natureza_juridica:  d.natureza_juridica || "",
+      situacao_cadastral: d.situacao || "",
+      data_situacao:      d.data_situicao ? d.data_situicao.split("/").reverse().join("-") : null,
+      socios_receita:     JSON.stringify(d.qsa || []),
+    };
+
+    return res.json({ ok: true, empresa });
+  } catch (e) {
+    const msg = String(e?.message || "");
+    const isTimeout = /abort|timeout|ECONNABORTED/i.test(msg);
+    console.error("REGISTER_CONSULTA_CNPJ_ERR", msg);
+    return res.status(isTimeout ? 504 : 500).json({
+      ok: false,
+      error: isTimeout ? "Tempo de consulta esgotado." : "Erro interno na consulta de CNPJ.",
+    });
+  }
+});
 
 /**
  * POST /api/registro/completo
  * Body: { empresa:{...}, pessoa:{...}, usuario:{...} }
- * Regras:
- * - Se CNPJ já existir no banco, aborta com 409 e mensagem amigável.
- * - Caso contrário, cria empresa, pessoa, usuário; vincula perfil admin,
- *   usuário↔empresa, usuário↔pessoa; e cria funcionário (cargo "colaborador").
+ * Fluxo:
+ * - Se CNPJ já existir no banco, 409 + mensagem amigável.
+ * - Caso contrário:
+ *   - cria empresa, pessoa, usuário
+ *   - garante perfil 'administrador'
+ *   - vincula usuário↔perfil/empresa e usuário↔pessoa
+ *   - cria funcionário (cargo "colaborador", regime MENSALISTA, salário_base 0.00)
  */
 router.post("/completo", async (req, res) => {
   const { empresa = {}, pessoa = {}, usuario = {} } = req.body || {};
