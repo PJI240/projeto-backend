@@ -97,11 +97,75 @@ router.get("/", requireAuth, async (_req, res) => {
   }
 });
 
-/* ======= GET /api/permissoes/minhas ======= */
+/* ======= GET /api/permissoes/minhas =======
+   Query:
+     - empresa_id (opcional; se omitido, usa a 1ª do usuário)
+     - principal=1 (opcional; se presente/1, usa somente o perfil_principal de empresas_usuarios)
+     - perfil_id=ID (opcional; força pegar permissões deste perfil específico)
+*/
 router.get("/minhas", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const principalOnly = String(req.query.principal || "") === "1";
+    const perfilIdFilter = Number(req.query.perfil_id || 0) || null;
 
+    // 1) PERFIL ESPECÍFICO (perfil_id=...)
+    if (perfilIdFilter) {
+      const [rows] = await pool.query(
+        `
+        SELECT DISTINCT pm.codigo
+          FROM perfis_permissoes pp
+          JOIN permissoes pm  ON pm.id = pp.permissao_id
+         WHERE pp.empresa_id = ? AND pp.perfil_id = ?
+        `,
+        [empresaId, perfilIdFilter]
+      );
+      return res.json({ ok: true, scope: "perfil_id", perfil_id: perfilIdFilter, codes: rows.map(r => r.codigo) });
+    }
+
+    // 2) APENAS PERFIL PRINCIPAL (empresas_usuarios.perfil_principal)
+    if (principalOnly) {
+      // resolve o perfil principal textual -> id do perfil na empresa
+      const [[eu]] = await pool.query(
+        `
+        SELECT eu.perfil_principal
+          FROM empresas_usuarios eu
+         WHERE eu.usuario_id = ? AND eu.empresa_id = ? AND eu.ativo = 1
+         LIMIT 1
+        `,
+        [req.userId, empresaId]
+      );
+      if (!eu) {
+        return res.json({ ok: true, scope: "principal", codes: [] });
+      }
+
+      const [[perf]] = await pool.query(
+        `
+        SELECT p.id
+          FROM perfis p
+         WHERE p.empresa_id = ?
+           AND LOWER(p.nome) = LOWER(?)
+         LIMIT 1
+        `,
+        [empresaId, eu.perfil_principal || ""]
+      );
+      if (!perf) {
+        return res.json({ ok: true, scope: "principal", codes: [] });
+      }
+
+      const [rows] = await pool.query(
+        `
+        SELECT DISTINCT pm.codigo
+          FROM perfis_permissoes pp
+          JOIN permissoes pm  ON pm.id = pp.permissao_id
+         WHERE pp.empresa_id = ? AND pp.perfil_id = ?
+        `,
+        [empresaId, perf.id]
+      );
+      return res.json({ ok: true, scope: "principal", perfil_id: perf.id, codes: rows.map(r => r.codigo) });
+    }
+
+    // 3) PADRÃO: UNIÃO DE TODOS PERFIS QUE O USUÁRIO POSSUI NA EMPRESA
     const [rows] = await pool.query(
       `
       SELECT DISTINCT pm.codigo
@@ -112,8 +176,7 @@ router.get("/minhas", requireAuth, async (req, res) => {
       `,
       [req.userId, empresaId]
     );
-
-    return res.json({ ok: true, codes: rows.map(r => r.codigo) });
+    return res.json({ ok: true, scope: "all_profiles", codes: rows.map(r => r.codigo) });
   } catch (e) {
     console.error("PERMISSOES_MINHAS_ERR", e);
     return res.status(400).json({ ok: false, error: "Falha ao obter permissões." });
