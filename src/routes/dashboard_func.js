@@ -41,17 +41,18 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 
 const pad2 = (n) => String(n).padStart(2, "0");
 function nowBR() {
-  // usa horário do servidor; se precisar, troque para fuso específico
   const d = new Date();
+  // Ajusta para o fuso horário de Brasília (UTC-3)
+  const offset = -3 * 60; // UTC-3 em minutos
+  d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + offset);
+  
   const iso = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
   const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   return { iso, hhmm, date: d };
 }
 
 /* ========== resolve funcionário vinculado ao usuário para a empresa ========== */
-/** retorna: { id, pessoa_nome, cargo_nome } */
 async function getFuncionarioDoUsuario(empresaId, userId) {
-  // vinculo 1:1 via usuarios_pessoas
   const [rows] = await pool.query(
     `
     SELECT f.id,
@@ -70,19 +71,6 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
 }
 
 /* ========== GET /api/dashboard_func/hoje ========== */
-/**
- * Retorna dados agregados para a tela do colaborador.
- * Query opcional: ?empresa_id=...
- * Resposta:
- * {
- *   ok, empresa_id,
- *   funcionario: { id, pessoa_nome, cargo_nome },
- *   data: "YYYY-MM-DD",
- *   escala: [{id, entrada, saida, turno_ordem}],
- *   apontamentos: [{id, turno_ordem, entrada, saida, origem}],
- *   estado: "TRABALHANDO" | "FORA"
- * }
- */
 router.get("/hoje", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
@@ -130,13 +118,6 @@ router.get("/hoje", requireAuth, async (req, res) => {
 });
 
 /* ========== POST /api/dashboard_func/clock ========== */
-/**
- * Bater ponto (toggle).
- * Body opcional: { empresa_id } (se tiver múltiplas empresas).
- * Lógica:
- *  - se houver apontamento aberto hoje → fecha com saída agora
- *  - senão → cria apontamento com entrada agora (turno_ordem = máx + 1)
- */
 router.post("/clock", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -148,6 +129,12 @@ router.post("/clock", requireAuth, async (req, res) => {
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
+
+    // Validação do formato de hora
+    const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/;
+    if (!timeRegex.test(hhmm)) {
+      throw new Error(`Formato de hora inválido: ${hhmm}`);
+    }
 
     // pega apontamentos de hoje
     const [aps] = await conn.query(
@@ -161,30 +148,61 @@ router.post("/clock", requireAuth, async (req, res) => {
     const aberto = aps.find((a) => a.entrada && !a.saida);
 
     if (aberto) {
-      // fechar
+      // Valida se a saída é depois da entrada
+      const entradaTime = new Date(`${iso}T${aberto.entrada}:00`);
+      const saidaTime = new Date(`${iso}T${hhmm}:00`);
+      
+      if (saidaTime <= entradaTime) {
+        throw new Error("Horário de saída deve ser após o horário de entrada");
+      }
+
+      // fechar apontamento
       await conn.query(
         `UPDATE apontamentos
-            SET saida = ?
+            SET saida = ?, updated_at = NOW()
           WHERE id = ?`,
         [hhmm, aberto.id]
       );
+      
       await conn.commit();
-      return res.json({ ok: true, action: "saida", id: aberto.id, saida: hhmm });
+      return res.json({ 
+        ok: true, 
+        action: "saida", 
+        id: aberto.id, 
+        saida: hhmm,
+        message: "Saída registrada com sucesso!"
+      });
     } else {
-      // novo
+      // novo apontamento
       const maxTurno = aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
 
-      // regra de unicidade (empresa_id, funcionario_id, data, turno_ordem, origem)
-      // aqui usamos origem = APONTADO
+      // Verifica se já existe apontamento com mesma chave
+      const [existing] = await conn.query(
+        `SELECT id FROM apontamentos 
+         WHERE empresa_id = ? AND funcionario_id = ? AND data = ? AND turno_ordem = ? AND origem = ?`,
+        [empresaId, func.id, iso, maxTurno + 1, "APONTADO"]
+      );
+
+      if (existing.length > 0) {
+        throw new Error("Já existe um apontamento para este turno");
+      }
+
       const [ins] = await conn.query(
         `INSERT INTO apontamentos
-           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs)
-         VALUES (?,?,?,?,?,?,?,NULL)`,
+           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,NULL,NOW(),NOW())`,
         [empresaId, func.id, iso, maxTurno + 1, hhmm, null, "APONTADO"]
       );
 
       await conn.commit();
-      return res.json({ ok: true, action: "entrada", id: ins.insertId, entrada: hhmm, turno_ordem: maxTurno + 1 });
+      return res.json({ 
+        ok: true, 
+        action: "entrada", 
+        id: ins.insertId, 
+        entrada: hhmm, 
+        turno_ordem: maxTurno + 1,
+        message: "Entrada registrada com sucesso!"
+      });
     }
   } catch (e) {
     if (conn) await conn.rollback();
