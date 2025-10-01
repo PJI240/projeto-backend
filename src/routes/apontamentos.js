@@ -72,6 +72,30 @@ async function assertFuncionarioEmpresa(conn, funcionarioId, empresaId) {
   if (!row) throw new Error("Funcionário não pertence à empresa selecionada.");
 }
 
+// NOVA FUNÇÃO: Validação flexível para turnos noturnos
+function validateHorarios(entrada, saida) {
+  if (!entrada || !saida) return null; // Sem validação se um dos horários estiver vazio
+  
+  const mi = minutes(entrada);
+  const mo = minutes(saida);
+  
+  if (mi === null || mo === null) return null;
+  
+  // Permite turnos noturnos (saída < entrada) mas valida diferenças absurdas
+  const diffMinutos = mo < mi ? (mo + 1440 - mi) : (mo - mi); // 1440 = minutos em 24h
+  
+  // Validações de senso comum
+  if (diffMinutos < 1) {
+    return "Diferença mínima de 1 minuto entre entrada e saída";
+  }
+  
+  if (diffMinutos > 18 * 60) { // 18 horas máximo
+    return "Jornada muito longa (máximo 18 horas)";
+  }
+  
+  return null; // Válido
+}
+
 /* ===================== GET /api/apontamentos ===================== */
 /**
  * Lista apontamentos do período (inclusive).
@@ -149,11 +173,12 @@ router.post("/", requireAuth, async (req, res) => {
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
       return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)." });
     }
-    // regra simples: se ambos existem, saída >= entrada
+    
+    // CORREÇÃO: Usar validação flexível para turnos noturnos
     if (entrada && saida) {
-      const mi = minutes(entrada), mo = minutes(saida);
-      if (mo < mi) {
-        return res.status(400).json({ ok: false, error: "Saída menor que a entrada. Para virada de dia, use dois apontamentos." });
+      const erro = validateHorarios(entrada, saida);
+      if (erro) {
+        return res.status(400).json({ ok: false, error: erro });
       }
     }
 
@@ -216,10 +241,12 @@ router.put("/:id", requireAuth, async (req, res) => {
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
       return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)." });
     }
+    
+    // CORREÇÃO: Usar validação flexível para turnos noturnos
     if (entrada && saida) {
-      const mi = minutes(entrada), mo = minutes(saida);
-      if (mo < mi) {
-        return res.status(400).json({ ok: false, error: "Saída menor que a entrada. Para virada de dia, use dois apontamentos." });
+      const erro = validateHorarios(entrada, saida);
+      if (erro) {
+        return res.status(400).json({ ok: false, error: erro });
       }
     }
 
@@ -342,7 +369,12 @@ router.post("/import", requireAuth, async (req, res) => {
       else if (!isValidISODate(data)) erro = "data inválida (YYYY-MM-DD)";
       else if (!isValidTimeOrNull(entrada)) erro = "entrada inválida";
       else if (!isValidTimeOrNull(saida)) erro = "saida inválida";
-      else if (entrada && saida && minutes(saida) < minutes(entrada)) erro = "saida < entrada";
+      
+      // CORREÇÃO: Usar validação flexível
+      else if (entrada && saida) {
+        const validacao = validateHorarios(entrada, saida);
+        if (validacao) erro = validacao;
+      }
 
       if (erro) {
         invalidas.push({ index: i, motivo: erro });
