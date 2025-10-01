@@ -51,21 +51,33 @@ function nowBR() {
   return { iso, hhmm, date: d };
 }
 
-/* ========== resolve funcionário vinculado ao usuário para a empresa ========== */
+/* ========== resolve funcionário vinculado ao usuário para a empresa (robusta) ========== */
 async function getFuncionarioDoUsuario(empresaId, userId) {
   const [rows] = await pool.query(
     `
-    SELECT f.id,
-           p.nome  AS pessoa_nome,
-           c.nome  AS cargo_nome
-      FROM usuarios_pessoas up
-      JOIN pessoas p       ON p.id = up.pessoa_id
-      JOIN funcionarios f  ON f.pessoa_id = p.id AND f.empresa_id = up.empresa_id
-      LEFT JOIN cargos c   ON c.id = f.cargo_id
-     WHERE up.empresa_id = ? AND up.usuario_id = ?
-     LIMIT 1
+    SELECT
+      f.id,
+      p.nome  AS pessoa_nome,
+      c.nome  AS cargo_nome
+    FROM empresas_usuarios eu
+    /* mesmo usuário + MESMA empresa */
+    JOIN usuarios_pessoas up
+      ON up.usuario_id = eu.usuario_id
+     AND up.empresa_id = eu.empresa_id
+    /* funcionário da MESMA pessoa e MESMA empresa */
+    JOIN funcionarios f
+      ON f.pessoa_id  = up.pessoa_id
+     AND f.empresa_id = eu.empresa_id
+    LEFT JOIN pessoas p ON p.id = f.pessoa_id
+    LEFT JOIN cargos  c ON c.id = f.cargo_id
+    WHERE eu.usuario_id = ?
+      AND eu.empresa_id = ?
+      AND eu.ativo = 1
+    /* se houver duplicidade, preferir ativo (se existir) e id menor */
+    ORDER BY COALESCE(f.ativo, 1) DESC, f.id ASC
+    LIMIT 1
     `,
-    [empresaId, userId]
+    [userId, empresaId]
   );
   return rows[0] || null;
 }
