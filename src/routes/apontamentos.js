@@ -239,7 +239,7 @@ router.put("/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Funcionário e data são obrigatórios." });
     }
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
-      return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)." });
+      return res.status(400).json({ ok: false, error: "Horários inválidos (HH:MM)!!!." });
     }
     
     // CORREÇÃO: Usar validação flexível para turnos noturnos
