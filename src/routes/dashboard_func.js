@@ -122,7 +122,10 @@ router.post("/clock", requireAuth, async (req, res) => {
     const func = await getFuncionarioDoUsuario(empresaId, req.userId);
     if (!func) return res.status(404).json({ ok: false, error: "Funcionário não encontrado para este usuário." });
 
-    const { iso, time } = nowBR(); // CORREÇÃO: usar 'time' ao invés de 'hhmm'
+    const { iso, time } = nowBR();
+
+    // DEBUG: Log para verificar o formato da hora
+    console.log("DEBUG - Registrando ponto:", { data: iso, hora: time });
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -140,7 +143,10 @@ router.post("/clock", requireAuth, async (req, res) => {
 
     if (aberto) {
       // CORREÇÃO: Validar se a hora de saída é posterior à entrada
-      if (aberto.entrada && time <= aberto.entrada) {
+      const entradaTime = new Date(`1970-01-01T${aberto.entrada}Z`);
+      const saidaTime = new Date(`1970-01-01T${time}Z`);
+      
+      if (saidaTime <= entradaTime) {
         await conn.rollback();
         return res.status(400).json({ 
           ok: false, 
@@ -180,18 +186,26 @@ router.post("/clock", requireAuth, async (req, res) => {
     }
   } catch (e) {
     if (conn) await conn.rollback();
-    console.error("DASH_FUNC_CLOCK_ERR", e);
+    console.error("DASH_FUNC_CLOCK_ERR - Detalhes:", {
+      message: e.message,
+      stack: e.stack,
+      code: e.code
+    });
+    
     const msg = String(e?.message || "");
     
     // CORREÇÃO: Melhor tratamento de erros específicos
     if (/invalid time|hour|minute|second/i.test(msg)) {
-      return res.status(400).json({ ok: false, error: "Formato de hora inválido." });
+      return res.status(400).json({ ok: false, error: "Formato de hora inválido: " + msg });
     }
     if (/Duplicate entry/i.test(msg)) {
       return res.status(409).json({ ok: false, error: "Já existe um registro com esses dados." });
     }
     if (/check constraint|constraint fails/i.test(msg)) {
       return res.status(400).json({ ok: false, error: "Regra de negócio violada: " + msg });
+    }
+    if (/truncated|incorrect time/i.test(msg)) {
+      return res.status(400).json({ ok: false, error: "Formato de hora incorreto para o banco de dados." });
     }
     
     return res.status(400).json({ ok: false, error: msg || "Falha ao registrar ponto." });
