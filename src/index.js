@@ -131,7 +131,7 @@ app.get("/health", (_req, res) => {
 });
 
 // Mock de resumo (fallback)
-app.get("/api/dashboard/resumo", (_req, res) => {
+app.get("/api/dashboard_func", (_req, res) => {
   res.json({
     ok: true,
     counts: { usuarios: 1, pessoas: 0, empresas: 0 },
