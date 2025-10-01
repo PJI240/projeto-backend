@@ -176,9 +176,9 @@ router.post("/clock", requireAuth, async (req, res) => {
       // fechar apontamento
       await conn.query(
         `UPDATE apontamentos
-            SET saida = ?, updated_at = NOW()
+            SET saida = ?
           WHERE id = ?`,
-        [saidaFinal, aberto.id]
+        [saidaFinal]
       );
       
       await conn.commit();
