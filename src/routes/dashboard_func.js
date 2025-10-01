@@ -45,7 +45,7 @@ function nowBR() {
   // Ajusta para o fuso horário de Brasília (UTC-3)
   const offset = -3 * 60; // UTC-3 em minutos
   d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + offset);
-  
+
   const iso = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
   const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   return { iso, hhmm, date: d };
@@ -71,7 +71,6 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
     WHERE eu.usuario_id = ?
       AND eu.empresa_id = ?
       AND eu.ativo = 1
-    /* se houver duplicidade, prioriza funcionário ativo (se houver coluna) e o id menor */
     ORDER BY COALESCE(f.ativo, 1) DESC, f.id ASC
     LIMIT 1
     `,
@@ -80,6 +79,7 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
 
   return rows[0] || null;
 }
+
 /* ========== GET /api/dashboard_func/hoje ========== */
 router.get("/hoje", requireAuth, async (req, res) => {
   try {
@@ -140,13 +140,13 @@ router.post("/clock", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Validação do formato de hora
-    const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/;
+    // Validação simples do formato de hora HH:MM
+    const timeRegex = /^([01]?\d|2[0-3]):[0-5]\d$/;
     if (!timeRegex.test(hhmm)) {
       throw new Error(`Formato de hora inválido: ${hhmm}`);
     }
 
-    // pega apontamentos de hoje
+    // apontamentos de hoje
     const [aps] = await conn.query(
       `SELECT id, turno_ordem, entrada, saida, origem
          FROM apontamentos
@@ -158,50 +158,46 @@ router.post("/clock", requireAuth, async (req, res) => {
     const aberto = aps.find((a) => a.entrada && !a.saida);
 
     if (aberto) {
-      // CORREÇÃO PRINCIPAL: Validação mais flexível para horários
-      const entradaTime = new Date(`${iso}T${aberto.entrada}`).getTime();
-      const saidaTime = new Date(`${iso}T${hhmm}`).getTime();
-      
-      // Permite saída no dia seguinte (quando saidaTime < entradaTime)
-      // Mas ainda valida casos absurdos (mais de 12 horas de diferença negativa)
-      const diffHoras = (saidaTime - entradaTime) / (1000 * 60 * 60);
-      
+      // Fechando turno aberto
+      const entradaTime = new Date(`${iso}T${aberto.entrada}:00`).getTime();
+      const saidaTime   = new Date(`${iso}T${hhmm}:00`).getTime();
+      const diffHoras   = (saidaTime - entradaTime) / 36e5; // ms -> horas
+
       if (diffHoras < -12) {
-        throw new Error("Horário de saída inválido: diferença muito grande em relação à entrada");
+        throw new Error("Horário de saída inválido: diferença muito grande em relação à entrada.");
       }
 
-      // Se a saída for anterior à entrada, assume que é no dia seguinte
-      const saidaFinal = saidaTime < entradaTime ? hhmm : hhmm;
+      const saidaFinal = hhmm; // se for virada, regra do seu backend geral cuida em outra tela
 
-      // fechar apontamento
       await conn.query(
         `UPDATE apontamentos
-            SET saida = ?
+            SET saida = ?, updated_at = NOW()
           WHERE id = ?`,
-        [saidaFinal]
+        [saidaFinal, aberto.id] // <<< AQUI estava o bug: faltava 'aberto.id'
       );
-      
+
       await conn.commit();
-      return res.json({ 
-        ok: true, 
-        action: "saida", 
-        id: aberto.id, 
+      return res.json({
+        ok: true,
+        action: "saida",
+        id: aberto.id,
         saida: saidaFinal,
-        message: "Saída registrada com sucesso!"
+        message: "Saída registrada com sucesso!",
       });
     } else {
-      // novo apontamento
-      const maxTurno = aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
+      // Novo turno
+      const maxTurno =
+        aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
 
-      // Verifica se já existe apontamento com mesma chave
+      // Checagem de duplicidade (chave lógica)
       const [existing] = await conn.query(
-        `SELECT id FROM apontamentos 
-         WHERE empresa_id = ? AND funcionario_id = ? AND data = ? AND turno_ordem = ? AND origem = ?`,
+        `SELECT id
+           FROM apontamentos 
+          WHERE empresa_id = ? AND funcionario_id = ? AND data = ? AND turno_ordem = ? AND origem = ?`,
         [empresaId, func.id, iso, maxTurno + 1, "APONTADO"]
       );
-
       if (existing.length > 0) {
-        throw new Error("Já existe um apontamento para este turno");
+        throw new Error("Já existe um apontamento para este turno.");
       }
 
       const [ins] = await conn.query(
@@ -212,13 +208,13 @@ router.post("/clock", requireAuth, async (req, res) => {
       );
 
       await conn.commit();
-      return res.json({ 
-        ok: true, 
-        action: "entrada", 
-        id: ins.insertId, 
-        entrada: hhmm, 
+      return res.json({
+        ok: true,
+        action: "entrada",
+        id: ins.insertId,
+        entrada: hhmm,
         turno_ordem: maxTurno + 1,
-        message: "Entrada registrada com sucesso!"
+        message: "Entrada registrado com sucesso!",
       });
     }
   } catch (e) {
