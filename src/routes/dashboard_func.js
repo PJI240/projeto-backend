@@ -51,35 +51,51 @@ function nowBR() {
   return { iso, hhmm, date: d };
 }
 
-/* ========== resolve funcionário vinculado ao usuário para a empresa (robusta) ========== */
+/* ========= funcionário do usuário na empresa (preferindo usuarios.pessoa_id) ========= */
 async function getFuncionarioDoUsuario(empresaId, userId) {
-  const [rows] = await pool.query(
+  // 1) Caminho preferencial: usuarios.pessoa_id -> funcionarios (mesma empresa)
+  const [viaUsuario] = await pool.query(
     `
-    SELECT
-      f.id,
-      p.nome  AS pessoa_nome,
-      c.nome  AS cargo_nome
-    FROM empresas_usuarios eu
-    /* mesmo usuário + MESMA empresa */
-    JOIN usuarios_pessoas up
-      ON up.usuario_id = eu.usuario_id
-     AND up.empresa_id = eu.empresa_id
-    /* funcionário da MESMA pessoa e MESMA empresa */
-    JOIN funcionarios f
-      ON f.pessoa_id  = up.pessoa_id
-     AND f.empresa_id = eu.empresa_id
-    LEFT JOIN pessoas p ON p.id = f.pessoa_id
-    LEFT JOIN cargos  c ON c.id = f.cargo_id
-    WHERE eu.usuario_id = ?
-      AND eu.empresa_id = ?
-      AND eu.ativo = 1
-    /* se houver duplicidade, preferir ativo (se existir) e id menor */
-    ORDER BY COALESCE(f.ativo, 1) DESC, f.id ASC
-    LIMIT 1
+    SELECT f.id,
+           p.nome  AS pessoa_nome,
+           c.nome  AS cargo_nome
+      FROM usuarios u
+      JOIN funcionarios f
+        ON f.pessoa_id  = u.pessoa_id
+       AND f.empresa_id = ?
+      LEFT JOIN pessoas p ON p.id = f.pessoa_id
+      LEFT JOIN cargos  c ON c.id = f.cargo_id
+     WHERE u.id = ? AND u.pessoa_id IS NOT NULL
+     ORDER BY COALESCE(f.ativo, 1) DESC, f.id ASC
+     LIMIT 1
+    `,
+    [empresaId, userId]
+  );
+  if (viaUsuario.length) return viaUsuario[0];
+
+  // 2) Fallback: usuarios_pessoas (mesma empresa) -> funcionarios
+  const [viaVinculo] = await pool.query(
+    `
+    SELECT f.id,
+           p.nome  AS pessoa_nome,
+           c.nome  AS cargo_nome
+      FROM usuarios_pessoas up
+      JOIN funcionarios f
+        ON f.pessoa_id  = up.pessoa_id
+       AND f.empresa_id = up.empresa_id
+      LEFT JOIN pessoas p ON p.id = f.pessoa_id
+      LEFT JOIN cargos  c ON c.id = f.cargo_id
+     WHERE up.usuario_id = ?
+       AND up.empresa_id = ?
+     ORDER BY COALESCE(f.ativo, 1) DESC, f.id ASC
+     LIMIT 1
     `,
     [userId, empresaId]
   );
-  return rows[0] || null;
+  if (viaVinculo.length) return viaVinculo[0];
+
+  // 3) Nada encontrado
+  return null;
 }
 
 /* ========== GET /api/dashboard_func/hoje ========== */
