@@ -57,14 +57,14 @@ async function fetchEscalas(empresaIds, from, to, apenasAtivos) {
   if (!empresaIds.length) return [];
   const [rows] = await pool.query(
     `
-    SELECT e.id,
-           e.empresa_id,
-           e.funcionario_id,
-           e.data,
-           e.turno_ordem,
-           TIME_FORMAT(e.entrada, '%H:%i:%s') AS entrada,
-           TIME_FORMAT(e.saida,   '%H:%i:%s') AS saida,
-           e.origem
+    SELECT   e.id,
+  e.empresa_id,
+  e.funcionario_id,
+  DATE_FORMAT(e.data, '%Y-%m-%d') AS data,   -- << aqui
+  e.turno_ordem,
+  TIME_FORMAT(e.entrada, '%H:%i:%s') AS entrada,
+  TIME_FORMAT(e.saida,   '%H:%i:%s') AS saida,
+  e.origem
       FROM escalas e
       JOIN funcionarios f ON f.id = e.funcionario_id
      WHERE f.empresa_id IN (?)
@@ -81,14 +81,14 @@ async function fetchApontamentos(empresaIds, from, to, apenasAtivos) {
   if (!empresaIds.length) return [];
   const [rows] = await pool.query(
     `
-    SELECT a.id,
-           a.funcionario_id,
-           a.data,
-           a.turno_ordem,
-           TIME_FORMAT(a.entrada, '%H:%i:%s') AS entrada,
-           TIME_FORMAT(a.saida,   '%H:%i:%s') AS saida,
-           UPPER(TRIM(a.origem)) AS origem,
-           a.obs
+    SELECT   a.id,
+  a.funcionario_id,
+  DATE_FORMAT(a.data, '%Y-%m-%d') AS data,   -- << aqui
+  a.turno_ordem,
+  TIME_FORMAT(a.entrada, '%H:%i:%s') AS entrada,
+  TIME_FORMAT(a.saida,   '%H:%i:%s') AS saida,
+  UPPER(TRIM(a.origem)) AS origem,
+  a.obs
       FROM apontamentos a
       JOIN funcionarios f ON f.id = a.funcionario_id
      WHERE f.empresa_id IN (?)
