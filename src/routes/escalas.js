@@ -40,3 +40,4 @@ const salvarEscalasMultiplas = async () => {
     setLoading(false);
   }
 };
+export default router;
