@@ -20,6 +20,7 @@ import escalasRoutes from "./routes/escalas.js";
 import apontamentosRoutes from "./routes/apontamentos.js";
 import dashboardFuncRoutes from "./routes/dashboard_func.js";
 import permissoesMenuRoutes from "./routes/permissoes_menu.js";
+import dashboardAdmRoutes from "./routes/dashboardAdm.js";
 
 const CONFIG = {
   JWT_SECRET: process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
@@ -115,6 +116,7 @@ app.use("/api/escalas", escalasRoutes);
 app.use("/api/apontamentos", apontamentosRoutes);
 app.use("/api/dashboard_func", dashboardFuncRoutes);
 app.use("/api/permissoes_menu", permissoesMenuRoutes);
+app.use("/api", dashboardAdmRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
