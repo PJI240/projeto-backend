@@ -23,7 +23,7 @@ import permissoesMenuRoutes from "./routes/permissoes_menu.js";
 import dashboardAdmRoutes from "./routes/dashboardAdm.js";
 import ocorrenciasRouter from "./routes/ocorrencias.js";
 import folhasItensRouter from "./routes/folhas_itens.js";
-
+import folhasRouter from "./routes/folhas.js";
 
 
 
@@ -124,6 +124,7 @@ app.use("/api/permissoes_menu", permissoesMenuRoutes);
 app.use("/api", dashboardAdmRoutes);
 app.use("/api/ocorrencias", ocorrenciasRouter);
 app.use("/api", folhasItensRouter);
+app.use("/api", folhasRouter);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
