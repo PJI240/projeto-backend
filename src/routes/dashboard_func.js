@@ -1,10 +1,11 @@
 import { Router } from "express";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import { pool } from "../db.js";
 
 const router = Router();
 
-/* ========== helpers comuns ========== */
+/* ========== auth básico ========== */
 function requireAuth(req, res, next) {
   try {
     const { token } = req.cookies || {};
@@ -17,6 +18,7 @@ function requireAuth(req, res, next) {
   }
 }
 
+/* ========== helpers comuns ========== */
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `SELECT empresa_id
@@ -39,13 +41,22 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 }
 
 const pad2 = (n) => String(n).padStart(2, "0");
-function nowBR() {
-  const d = new Date();
-  const offset = -3 * 60; // UTC-3 em minutos
-  d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + offset);
-  const iso = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-  const hhmm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  return { iso, hhmm, date: d };
+function nowUtc() {
+  // data/hora do servidor (UTC) em Date
+  return new Date();
+}
+function brDateISO(d = new Date()) {
+  // Apenas a data-base (YYYY-MM-DD) em America/Sao_Paulo
+  const tzOffsetMin = -3 * 60; // UTC-3 (ajuste simples)
+  const dd = new Date(d.getTime());
+  dd.setMinutes(dd.getMinutes() + dd.getTimezoneOffset() + tzOffsetMin);
+  return `${dd.getFullYear()}-${pad2(dd.getMonth() + 1)}-${pad2(dd.getDate())}`;
+}
+function hhmmNowBR() {
+  const tzOffsetMin = -3 * 60;
+  const dd = new Date();
+  dd.setMinutes(dd.getMinutes() + dd.getTimezoneOffset() + tzOffsetMin);
+  return `${pad2(dd.getHours())}:${pad2(dd.getMinutes())}`;
 }
 
 /* ========= funcionário do usuário na empresa ========= */
@@ -55,7 +66,8 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
     SELECT
       f.id,
       p.nome AS pessoa_nome,
-      c.nome AS cargo_nome
+      c.nome AS cargo_nome,
+      e.cnpj AS empresa_cnpj
     FROM empresas_usuarios eu
     JOIN usuarios_pessoas up
       ON up.usuario_id = eu.usuario_id
@@ -65,6 +77,7 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
      AND f.empresa_id = eu.empresa_id
     LEFT JOIN pessoas p ON p.id = f.pessoa_id
     LEFT JOIN cargos  c ON c.id = f.cargo_id
+    LEFT JOIN empresas e ON e.id = eu.empresa_id
     WHERE eu.usuario_id = ?
       AND eu.empresa_id = ?
       AND eu.ativo = 1
@@ -76,6 +89,61 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
   return rows[0] || null;
 }
 
+/* ========= coletor (REP-P) ========= */
+async function getOrCreateColetorId({ empresaId, identificador, versao }) {
+  if (!identificador) return null;
+  const idf = String(identificador).slice(0, 120);
+  const ver = versao ? String(versao).slice(0, 40) : null;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [r1] = await conn.query(
+      `SELECT id FROM rep_coletores WHERE identificador = ? LIMIT 1`,
+      [idf]
+    );
+    if (r1.length) {
+      const coletorId = r1[0].id;
+      // opcional: atualiza versão se mudou
+      if (ver) {
+        await conn.query(`UPDATE rep_coletores SET versao = ? WHERE id = ?`, [ver, coletorId]);
+      }
+      await conn.commit();
+      return coletorId;
+    }
+
+    const [ins] = await conn.query(
+      `INSERT INTO rep_coletores (empresa_id, identificador, versao, ativo)
+       VALUES (?, ?, ?, 1)`,
+      [empresaId, idf, ver]
+    );
+    await conn.commit();
+    return ins.insertId;
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+/* ========= hash canônico ========= */
+function calcHash({ estabelecimento_cnpj, funcionario_id, nsr, dt_marcacao, tz, dt_gravacao, coletor_id }) {
+  // Canon: CNPJ14|FUNCID|NSR|DT_MARCACAO_ISO|TZ|DT_GRAVACAO_ISO|COLETORID
+  const cnpj14 = String(estabelecimento_cnpj || "").replace(/\D/g, "").padStart(14, "0").slice(-14);
+  const parts = [
+    cnpj14,
+    String(funcionario_id || ""),
+    String(nsr || ""),
+    dt_marcacao ? new Date(dt_marcacao).toISOString() : "",
+    String(tz || ""),
+    dt_gravacao ? new Date(dt_gravacao).toISOString() : "",
+    String(coletor_id || ""),
+  ];
+  return crypto.createHash("sha256").update(parts.join("|")).digest("hex");
+}
+
 /* ========== GET /api/dashboard_func/hoje ========== */
 router.get("/hoje", requireAuth, async (req, res) => {
   try {
@@ -83,7 +151,7 @@ router.get("/hoje", requireAuth, async (req, res) => {
     const func = await getFuncionarioDoUsuario(empresaId, req.userId);
     if (!func) return res.status(404).json({ ok: false, error: "Funcionário não encontrado para este usuário." });
 
-    const { iso } = nowBR();
+    const iso = brDateISO();
 
     const [esc] = await pool.query(
       `
@@ -97,7 +165,8 @@ router.get("/hoje", requireAuth, async (req, res) => {
 
     const [ap] = await pool.query(
       `
-        SELECT id, turno_ordem, entrada, saida, origem
+        SELECT id, turno_ordem, entrada, saida, origem, is_rep_oficial, status_tratamento,
+               tz, coletor_id, nsr, dt_marcacao, dt_gravacao
           FROM apontamentos
          WHERE empresa_id = ? AND funcionario_id = ? AND data = ?
          ORDER BY turno_ordem ASC, id ASC
@@ -111,7 +180,7 @@ router.get("/hoje", requireAuth, async (req, res) => {
     return res.json({
       ok: true,
       empresa_id: empresaId,
-      funcionario: func,
+      funcionario: { id: func.id, pessoa_nome: func.pessoa_nome, cargo_nome: func.cargo_nome },
       data: iso,
       escala: esc,
       apontamentos: ap,
@@ -124,6 +193,16 @@ router.get("/hoje", requireAuth, async (req, res) => {
 });
 
 /* ========== POST /api/dashboard_func/clock ========== */
+/**
+ * Body esperado (do front):
+ * {
+ *   empresa_id?: number,
+ *   origem: "APONTADO",
+ *   tz: "America/Sao_Paulo",
+ *   coletor_identificador: "web:platform:ua",
+ *   coletor_versao?: "xx"
+ * }
+ */
 router.post("/clock", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -131,17 +210,30 @@ router.post("/clock", requireAuth, async (req, res) => {
     const func = await getFuncionarioDoUsuario(empresaId, req.userId);
     if (!func) return res.status(404).json({ ok: false, error: "Funcionário não encontrado para este usuário." });
 
-    const { iso, hhmm } = nowBR();
+    const tz = String(req.body?.tz || "America/Sao_Paulo");
+    const origem = "APONTADO"; // oficial
+    const entradaHHMM = hhmmNowBR();
+    const iso = brDateISO();           // data-base (America/Sao_Paulo)
+    const dtMarc = nowUtc();           // percepção do cliente não é confiável; usamos servidor UTC para registrar
+    const dtGrav = nowUtc();
+    const cnpj14 = String(func.empresa_cnpj || "").replace(/\D/g, "").padStart(14, "0").slice(-14) || null;
 
     // valida HH:MM
-    if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(hhmm)) {
-      return res.status(400).json({ ok: false, error: `Formato de hora inválido: ${hhmm}` });
+    if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(entradaHHMM)) {
+      return res.status(400).json({ ok: false, error: `Formato de hora inválido: ${entradaHHMM}` });
     }
+
+    // resolve coletor
+    const coletor_id = await getOrCreateColetorId({
+      empresaId,
+      identificador: req.body?.coletor_identificador,
+      versao: req.body?.coletor_versao,
+    });
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // apontamentos de hoje
+    // carrega apontamentos de hoje
     const [aps] = await conn.query(
       `SELECT id, turno_ordem, entrada, saida, origem
          FROM apontamentos
@@ -153,44 +245,65 @@ router.post("/clock", requireAuth, async (req, res) => {
     const aberto = aps.find((a) => a.entrada && !a.saida);
 
     if (aberto) {
-      // fechar turno aberto
-      const entradaTime = new Date(`${iso}T${aberto.entrada}:00`).getTime();
-      const saidaTime   = new Date(`${iso}T${hhmm}:00`).getTime();
-      const diffHoras   = (saidaTime - entradaTime) / 36e5; // horas
-
-      if (diffHoras < -12) {
-        throw new Error("Horário de saída inválido: diferença muito grande em relação à entrada.");
-      }
-
+      // ========= fechar turno aberto =========
+      // ATENÇÃO aos triggers: se você bloqueou update de oficiais,
+      // permita alteração de SAÍDA quando OLD.saida IS NULL.
       await conn.query(
         `UPDATE apontamentos
-            SET saida = ?
+            SET saida = ?, dt_gravacao = ?, tz = ?
           WHERE id = ?`,
-        [hhmm, aberto.id] // ✅ agora sem updated_at
+        [entradaHHMM, dtGrav, tz, aberto.id]
       );
-
       await conn.commit();
-      return res.json({ ok: true, action: "saida", id: aberto.id, saida: hhmm });
+      return res.json({ ok: true, action: "saida", id: aberto.id, saida: entradaHHMM });
     } else {
-      // novo turno
+      // ========= criar novo turno (entrada) =========
       const maxTurno = aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
 
-      // checa duplicidade lógica
-      const [existing] = await conn.query(
-        `SELECT id
-           FROM apontamentos
+      // previne duplicidade lógica do mesmo turno/origem
+      const [dup] = await conn.query(
+        `SELECT id FROM apontamentos
           WHERE empresa_id = ? AND funcionario_id = ? AND data = ? AND turno_ordem = ? AND origem = ?`,
-        [empresaId, func.id, iso, maxTurno + 1, "APONTADO"]
+        [empresaId, func.id, iso, maxTurno + 1, origem]
       );
-      if (existing.length > 0) {
+      if (dup.length) {
         throw new Error("Já existe um apontamento para este turno.");
       }
 
+      // NSR: pode ficar NULL aqui; normalmente é atribuído por gerador AFD (marcações)
+      const nsr = null;
+
+      // calcula hash com campos canônicos (mesmo com nsr nulo)
+      const hash_sha256 = calcHash({
+        estabelecimento_cnpj: cnpj14,
+        funcionario_id: func.id,
+        nsr,
+        dt_marcacao: dtMarc,
+        tz,
+        dt_gravacao: dtGrav,
+        coletor_id,
+      });
+
       const [ins] = await conn.query(
         `INSERT INTO apontamentos
-           (empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs)
-         VALUES (?,?,?,?,?,?,?,NULL)`,
-        [empresaId, func.id, iso, maxTurno + 1, hhmm, null, "APONTADO"]
+           (empresa_id, funcionario_id, data, turno_ordem,
+            entrada, saida, origem,
+            is_rep_oficial,
+            estabelecimento_cnpj, nsr,
+            tz, dt_marcacao, dt_gravacao, coletor_id, hash_sha256,
+            status_tratamento, obs)
+         VALUES (?,?,?,?,?,
+                 ?,?,
+                 1,
+                 ?,?,
+                 ?,?,?,?,?,
+                 'VALIDA', NULL)`,
+        [
+          empresaId, func.id, iso, maxTurno + 1,
+          entradaHHMM, null, origem,
+          cnpj14, nsr,
+          tz, dtMarc, dtGrav, coletor_id, hash_sha256,
+        ]
       );
 
       await conn.commit();
@@ -198,7 +311,7 @@ router.post("/clock", requireAuth, async (req, res) => {
         ok: true,
         action: "entrada",
         id: ins.insertId,
-        entrada: hhmm,
+        entrada: entradaHHMM,
         turno_ordem: maxTurno + 1,
       });
     }
@@ -206,6 +319,13 @@ router.post("/clock", requireAuth, async (req, res) => {
     if (conn) await conn.rollback();
     console.error("DASH_FUNC_CLOCK_ERR", e);
     const msg = String(e?.message || "");
+    // 45000 = erro de trigger custom (ex.: imutabilidade). Informe melhor:
+    if (msg.includes("imutável") || msg.includes("PTRP") || msg.includes("TRIGGER")) {
+      return res.status(405).json({
+        ok: false,
+        error: "Política de imutabilidade do apontamento oficial bloqueou a operação. Ajuste o trigger para permitir preencher a saída quando ela estiver vazia (OLD.saida IS NULL).",
+      });
+    }
     if (/Duplicate entry/i.test(msg)) {
       return res.status(409).json({ ok: false, error: "Conflito de duplicidade: já existe um registro igual." });
     }
