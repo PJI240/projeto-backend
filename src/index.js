@@ -25,6 +25,7 @@ import ocorrenciasRouter from "./routes/ocorrencias.js";
 import folhasItensRouter from "./routes/folhas_itens.js";
 import folhasRouter from "./routes/folhas.js";
 import folhasFuncionariosRouter from "./routes/folhas-funcionarios.js";
+import ptrpRoutes from "./routes/ptrp.js";
 
 const CONFIG = {
   JWT_SECRET: process.env.JWT_SECRET || "JWTprojetoINTEGRADOR2025",
@@ -125,7 +126,7 @@ app.use("/api/ocorrencias", ocorrenciasRouter);
 app.use("/api", folhasItensRouter);
 app.use("/api", folhasRouter);
 app.use("/api", folhasFuncionariosRouter);
-
+app.use("/api/ptrp", ptrpRoutes);
 
 // Healthcheck
 app.get("/health", (_req, res) => {
