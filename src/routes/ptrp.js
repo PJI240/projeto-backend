@@ -1,7 +1,7 @@
 // routes/ptrp.js
 import { Router } from "express";
 import { pool } from "../db.js";           // sua pool mysql2
-import { requireAuth } from "../middlewares/auth.js"; // use seu middleware
+import { requireAuth } from "../middlewares/requireAuth.js"; // use seu middleware
 
 const router = Router();
 
