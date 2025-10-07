@@ -3,8 +3,8 @@ import { Router } from "express";
 import { pool } from "../db.js";
 
 // ✅ Middleware de autenticação (use a forma que você realmente exporta)
-// import requireAuth from "../middlewares/requireAuth.js";    // se for export default
-import { requireAuth } from "../middlewares/requireAuth.js";   // se for export nomeado
+// import requireAuth from "../middleware/requireAuth.js";    // se for export default
+import { requireAuth } from "../middleware/requireAuth.js";   // se for export nomeado
 
 const router = Router();
 
