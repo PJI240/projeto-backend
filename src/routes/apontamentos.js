@@ -7,23 +7,30 @@ const router = Router();
 
 /* ===================== helpers ===================== */
 
+/** Empresas acessíveis ao USUÁRIO (via pessoa -> funcionarios) */
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
-    `SELECT empresa_id
-       FROM empresas_usuarios
-      WHERE usuario_id = ? AND ativo = 1`,
+    `
+    SELECT DISTINCT f.empresa_id
+      FROM usuarios u
+      JOIN pessoas p      ON p.id = u.pessoa_id
+      JOIN funcionarios f ON f.pessoa_id = p.id
+     WHERE u.id = ?
+    `,
     [userId]
   );
-  return rows.map((r) => r.empresa_id);
+  return rows.map(r => r.empresa_id);
 }
 
+/** Resolve a empresa do contexto para a requisição atual */
 async function resolveEmpresaContext(userId, empresaIdQuery) {
   const empresas = await getUserEmpresaIds(userId);
-  if (!empresas.length) throw new Error("Usuário sem empresa vinculada.");
-  if (empresaIdQuery) {
+  if (!empresas.length) throw new Error("Usuário sem vínculo funcional (funcionário) a nenhuma empresa.");
+
+  if (empresaIdQuery != null && empresaIdQuery !== "") {
     const id = Number(empresaIdQuery);
     if (empresas.includes(id)) return id;
-    throw new Error("Empresa não autorizada.");
+    throw new Error("Empresa não autorizada para o usuário.");
   }
   return empresas[0];
 }
