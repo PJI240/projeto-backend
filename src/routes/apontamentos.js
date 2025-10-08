@@ -1,32 +1,35 @@
 // src/routes/apontamentos.js
 import { Router } from "express";
 import { pool } from "../db.js";
-import { requireAuth } from "../middleware/requireAuth.js"; // ✅ middleware centralizado
+import { requireAuth } from "../middleware/requireAuth.js";
 
 const router = Router();
 
 /* ===================== helpers ===================== */
 
-/** Empresas acessíveis ao USUÁRIO (via pessoa -> funcionarios) */
+/** Empresas acessíveis ao usuário:
+ *  usuarios_pessoas → (pessoa_id) → funcionarios → (empresa_id)
+ *  Fallback: se não houver funcionário ativo, usa o empresa_id da própria usuarios_pessoas
+ */
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `
-    SELECT DISTINCT f.empresa_id
-      FROM usuarios u
-      JOIN pessoas p      ON p.id = u.pessoa_id
-      JOIN funcionarios f ON f.pessoa_id = p.id
-     WHERE u.id = ?
+    SELECT DISTINCT COALESCE(f.empresa_id, up.empresa_id) AS empresa_id
+      FROM usuarios_pessoas up
+ LEFT JOIN funcionarios f
+        ON f.pessoa_id = up.pessoa_id
+       AND (f.ativo = 1 OR f.ativo IS NULL)
+     WHERE up.usuario_id = ?
     `,
     [userId]
   );
-  return rows.map(r => r.empresa_id);
+  return rows.map((r) => r.empresa_id).filter((v) => v != null);
 }
 
-/** Resolve a empresa do contexto para a requisição atual */
+/** Resolve empresa do contexto validando contra as empresas do usuário */
 async function resolveEmpresaContext(userId, empresaIdQuery) {
   const empresas = await getUserEmpresaIds(userId);
-  if (!empresas.length) throw new Error("Usuário sem vínculo funcional (funcionário) a nenhuma empresa.");
-
+  if (!empresas.length) throw new Error("Usuário sem vínculo a nenhuma empresa.");
   if (empresaIdQuery != null && empresaIdQuery !== "") {
     const id = Number(empresaIdQuery);
     if (empresas.includes(id)) return id;
@@ -38,37 +41,31 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 function isValidISODate(s = "") {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s));
 }
-
 function normalizeTime(hhmm) {
   if (!hhmm) return null;
   const str = String(hhmm).trim();
   return str.split(":").slice(0, 2).join(":"); // HH:MM
 }
-
 function isValidTimeOrNull(s) {
   if (s == null || s === "") return true;
   const str = String(s).trim();
-  return /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(str); // aceita HH:MM e HH:MM:SS
+  return /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(str); // HH:MM ou HH:MM:SS
 }
-
 function clampTurno(n) {
   const v = Number(n);
   return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 1;
 }
-
 function normOrigem(s = "APONTADO") {
   const t = String(s || "").toUpperCase();
   return ["APONTADO", "IMPORTADO", "AJUSTE"].includes(t) ? t : "APONTADO";
 }
-
 function minutes(hhmm) {
   if (!hhmm) return null;
   const [h, m] = String(hhmm).split(":").map(Number);
   if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
   return h * 60 + m;
 }
-
-/** Garante que o funcionário pertence à empresa em questão */
+/** Confirma se o funcionário pertence à empresa informada */
 async function assertFuncionarioEmpresa(conn, funcionarioId, empresaId) {
   const [[row]] = await conn.query(
     `SELECT id FROM funcionarios WHERE id = ? AND empresa_id = ? LIMIT 1`,
@@ -76,16 +73,15 @@ async function assertFuncionarioEmpresa(conn, funcionarioId, empresaId) {
   );
   if (!row) throw new Error("Funcionário não pertence à empresa selecionada.");
 }
-
-/** Validação de horários (permite noturno) */
+/** Valida horários permitindo noturno (saída < entrada), com limites razoáveis */
 function validateHorarios(entrada, saida) {
   if (!entrada || !saida) return null;
   const mi = minutes(entrada);
   const mo = minutes(saida);
-  if (mi === null || mo === null) return null;
-  const diffMinutos = mo < mi ? mo + 1440 - mi : mo - mi; // 24h = 1440 min
-  if (diffMinutos < 1) return "Diferença mínima de 1 minuto entre entrada e saída";
-  if (diffMinutos > 18 * 60) return "Jornada muito longa (máximo 18 horas)";
+  if (mi == null || mo == null) return null;
+  const diff = mo < mi ? mo + 1440 - mi : mo - mi; // até virar o dia
+  if (diff < 1) return "Diferença mínima de 1 minuto entre entrada e saída";
+  if (diff > 18 * 60) return "Jornada muito longa (máximo 18 horas)";
   return null;
 }
 
@@ -94,7 +90,6 @@ router.get("/", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const { from, to, funcionario_id, origem } = req.query || {};
-
     if (!isValidISODate(from) || !isValidISODate(to)) {
       return res
         .status(400)
@@ -114,12 +109,12 @@ router.get("/", requireAuth, async (req, res) => {
 
     const [rows] = await pool.query(
       `
-        SELECT id, empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs
-          FROM apontamentos
-         WHERE empresa_id = ?
-           AND data BETWEEN ? AND ?
-           ${extra}
-         ORDER BY data ASC, funcionario_id ASC, turno_ordem ASC
+      SELECT id, empresa_id, funcionario_id, data, turno_ordem, entrada, saida, origem, obs
+        FROM apontamentos
+       WHERE empresa_id = ?
+         AND data BETWEEN ? AND ?
+         ${extra}
+       ORDER BY data ASC, funcionario_id ASC, turno_ordem ASC
       `,
       params
     );
@@ -127,9 +122,7 @@ router.get("/", requireAuth, async (req, res) => {
     return res.json({ ok: true, empresa_id: empresaId, apontamentos: rows });
   } catch (e) {
     console.error("APONT_LIST_ERR", e);
-    return res
-      .status(400)
-      .json({ ok: false, error: e.message || "Falha ao listar apontamentos." });
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao listar apontamentos." });
   }
 });
 
@@ -149,19 +142,16 @@ router.post("/", requireAuth, async (req, res) => {
     } = req.body || {};
 
     if (!Number(funcionario_id) || !isValidISODate(data)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Funcionário e data são obrigatórios." });
+      return res.status(400).json({ ok: false, error: "Funcionário e data são obrigatórios." });
     }
 
     const entradaNorm = entrada ? normalizeTime(entrada) : null;
     const saidaNorm = saida ? normalizeTime(saida) : null;
 
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
-      return res.status(400).json({
-        ok: false,
-        error: `Horários inválidos (formato HH:MM ou HH:MM:SS).`,
-      });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Horários inválidos (formato HH:MM ou HH:MM:SS)." });
     }
     if (entradaNorm && saidaNorm) {
       const err = validateHorarios(entradaNorm, saidaNorm);
@@ -209,7 +199,7 @@ router.post("/", requireAuth, async (req, res) => {
 });
 
 /* ===================== PUT /api/apontamentos/:id ===================== */
-/* ⚠️ Política: não editar oficiais. Só permite UPDATE se origem = 'AJUSTE'. */
+/* Política: não editar oficiais. Só permite UPDATE se origem = 'AJUSTE'. */
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -234,10 +224,9 @@ router.put("/:id", requireAuth, async (req, res) => {
     const saidaNorm = saida ? normalizeTime(saida) : null;
 
     if (!isValidTimeOrNull(entrada) || !isValidTimeOrNull(saida)) {
-      return res.status(400).json({
-        ok: false,
-        error: `Horários inválidos (formato HH:MM ou HH:MM:SS).`,
-      });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Horários inválidos (formato HH:MM ou HH:MM:SS)." });
     }
     if (entradaNorm && saidaNorm) {
       const err = validateHorarios(entradaNorm, saidaNorm);
@@ -247,7 +236,6 @@ router.put("/:id", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // verifica escopo e origem
     const [[row]] = await conn.query(
       `SELECT id, empresa_id, origem FROM apontamentos WHERE id = ? LIMIT 1`,
       [id]
@@ -273,7 +261,7 @@ router.put("/:id", requireAuth, async (req, res) => {
               turno_ordem = ?,
               entrada = ?,
               saida = ?,
-              origem = ?,   -- manter 'AJUSTE' se desejar
+              origem = ?,
               obs = ?
         WHERE id = ?`,
       [
@@ -282,7 +270,7 @@ router.put("/:id", requireAuth, async (req, res) => {
         clampTurno(turno_ordem),
         entradaNorm,
         saidaNorm,
-        normOrigem(origem), // se quiser travar para 'AJUSTE', troque para 'AJUSTE'
+        "AJUSTE", // força manter como AJUSTE
         obs || null,
         id,
       ]
@@ -306,7 +294,7 @@ router.put("/:id", requireAuth, async (req, res) => {
 });
 
 /* ===================== DELETE /api/apontamentos/:id ===================== */
-/* ⚠️ Política: não excluir oficiais. Só permite DELETE se origem = 'AJUSTE'. */
+/* Política: não excluir oficiais. Só permite DELETE se origem = 'AJUSTE'. */
 router.delete("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
