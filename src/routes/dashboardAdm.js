@@ -1,4 +1,4 @@
-// src/routes/adm_dashboard.js  (ou o mesmo nome que você já usa)
+// src/routes/dashboardAdm.js
 import { Router } from "express";
 import { pool } from "../db.js";
 
@@ -62,10 +62,10 @@ async function fetchEscalas(empresaIds, from, to, apenasAtivos) {
       e.id,
       e.empresa_id,
       e.funcionario_id,
-      DATE_FORMAT(e.data, '%Y-%m-%d')         AS data,
+      DATE_FORMAT(e.data, '%Y-%m-%d')    AS data,
       e.turno_ordem,
-      TIME_FORMAT(e.entrada, '%H:%i:%s')      AS entrada,
-      TIME_FORMAT(e.saida,   '%H:%i:%s')      AS saida,
+      TIME_FORMAT(e.entrada, '%H:%i:%s') AS entrada,
+      TIME_FORMAT(e.saida,   '%H:%i:%s') AS saida,
       e.origem
     FROM escalas e
     JOIN funcionarios f ON f.id = e.funcionario_id
@@ -88,7 +88,7 @@ async function fetchApontamentos(empresaIds, from, to, apenasAtivos) {
       a.funcionario_id,
       DATE_FORMAT(a.data, '%Y-%m-%d')         AS data,
       a.turno_ordem,
-      UPPER(a.evento)                         AS evento,        -- ENTRADA | SAIDA
+      UPPER(TRIM(a.evento))                   AS evento,        -- ENTRADA | SAIDA (sem espaços)
       TIME_FORMAT(a.horario, '%H:%i:%s')      AS horario,       -- HH:MM:SS
       UPPER(TRIM(a.origem))                   AS origem,        -- APONTADO | AJUSTE | IMPORTADO
       a.status_tratamento,
@@ -102,14 +102,18 @@ async function fetchApontamentos(empresaIds, from, to, apenasAtivos) {
     WHERE f.empresa_id IN (?)
       ${apenasAtivos ? "AND f.ativo = 1" : ""}
       AND a.data BETWEEN ? AND ?
-    ORDER BY a.data ASC, a.funcionario_id ASC, a.turno_ordem ASC, a.horario ASC, a.id ASC
+    ORDER BY a.data ASC,
+             a.funcionario_id ASC,
+             a.turno_ordem ASC,
+             a.horario ASC,
+             a.id ASC
     `,
     [empresaIds, from, to]
   );
   return rows;
 }
 
-/** ========= Endpoint agregado (mantido) =========
+/** ========= Endpoint agregado =========
  * GET /api/dashboard/adm?from=YYYY-MM-DD&to=YYYY-MM-DD
  * GET /api/dashboard/adm?data=YYYY-MM-DD
  * (opcional) ?ativos=1
