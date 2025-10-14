@@ -42,12 +42,11 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 
 const pad2 = (n) => String(n).padStart(2, "0");
 function nowUtc() {
-  // data/hora do servidor (UTC) em Date
-  return new Date();
+  return new Date(); // servidor em UTC
 }
 function brDateISO(d = new Date()) {
-  // Apenas a data-base (YYYY-MM-DD) em America/Sao_Paulo
-  const tzOffsetMin = -3 * 60; // UTC-3 (ajuste simples)
+  // YYYY-MM-DD com base em America/Sao_Paulo (UTC-3 simplificado)
+  const tzOffsetMin = -3 * 60;
   const dd = new Date(d.getTime());
   dd.setMinutes(dd.getMinutes() + dd.getTimezoneOffset() + tzOffsetMin);
   return `${dd.getFullYear()}-${pad2(dd.getMonth() + 1)}-${pad2(dd.getDate())}`;
@@ -81,7 +80,6 @@ async function getFuncionarioDoUsuario(empresaId, userId) {
     WHERE eu.usuario_id = ?
       AND eu.empresa_id = ?
       AND eu.ativo = 1
-    ORDER BY COALESCE(f.ativo, 1) DESC, f.id ASC
     LIMIT 1
     `,
     [userId, empresaId]
@@ -105,10 +103,7 @@ async function getOrCreateColetorId({ empresaId, identificador, versao }) {
     );
     if (r1.length) {
       const coletorId = r1[0].id;
-      // opcional: atualiza versão se mudou
-      if (ver) {
-        await conn.query(`UPDATE rep_coletores SET versao = ? WHERE id = ?`, [ver, coletorId]);
-      }
+      if (ver) await conn.query(`UPDATE rep_coletores SET versao = ? WHERE id = ?`, [ver, coletorId]);
       await conn.commit();
       return coletorId;
     }
@@ -163,19 +158,19 @@ router.get("/hoje", requireAuth, async (req, res) => {
       [empresaId, func.id, iso]
     );
 
-    const [ap] = await pool.query(
+    const [evs] = await pool.query(
       `
-        SELECT id, turno_ordem, entrada, saida, origem, is_rep_oficial, status_tratamento,
+        SELECT id, turno_ordem, evento, horario, origem, is_rep_oficial, status_tratamento,
                tz, coletor_id, nsr, dt_marcacao, dt_gravacao
           FROM apontamentos
          WHERE empresa_id = ? AND funcionario_id = ? AND data = ?
-         ORDER BY turno_ordem ASC, id ASC
+         ORDER BY horario ASC, id ASC
       `,
       [empresaId, func.id, iso]
     );
 
-    const aberto = ap.find((a) => a.entrada && !a.saida);
-    const estado = aberto ? "TRABALHANDO" : "FORA";
+    const ultimo = evs[evs.length - 1];
+    const estado = ultimo?.evento === "ENTRADA" ? "TRABALHANDO" : "FORA";
 
     return res.json({
       ok: true,
@@ -183,7 +178,7 @@ router.get("/hoje", requireAuth, async (req, res) => {
       funcionario: { id: func.id, pessoa_nome: func.pessoa_nome, cargo_nome: func.cargo_nome },
       data: iso,
       escala: esc,
-      apontamentos: ap,
+      apontamentos: evs,
       estado,
     });
   } catch (e) {
@@ -197,10 +192,10 @@ router.get("/hoje", requireAuth, async (req, res) => {
  * Body esperado (do front):
  * {
  *   empresa_id?: number,
- *   origem: "APONTADO",
- *   tz: "America/Sao_Paulo",
- *   coletor_identificador: "web:platform:ua",
- *   coletor_versao?: "xx"
+ *   origem?: "APONTADO",         // será forçado para APONTADO (oficial)
+ *   tz?: "America/Sao_Paulo",
+ *   coletor_identificador?: "web:platform:ua",
+ *   coletor_versao?: "x.y.z"
  * }
  */
 router.post("/clock", requireAuth, async (req, res) => {
@@ -212,16 +207,11 @@ router.post("/clock", requireAuth, async (req, res) => {
 
     const tz = String(req.body?.tz || "America/Sao_Paulo");
     const origem = "APONTADO"; // oficial
-    const entradaHHMM = hhmmNowBR();
-    const iso = brDateISO();           // data-base (America/Sao_Paulo)
-    const dtMarc = nowUtc();           // percepção do cliente não é confiável; usamos servidor UTC para registrar
+    const iso = brDateISO();   // data-base local
+    const hhmm = hhmmNowBR();
+    const dtMarc = nowUtc();
     const dtGrav = nowUtc();
     const cnpj14 = String(func.empresa_cnpj || "").replace(/\D/g, "").padStart(14, "0").slice(-14) || null;
-
-    // valida HH:MM
-    if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(entradaHHMM)) {
-      return res.status(400).json({ ok: false, error: `Formato de hora inválido: ${entradaHHMM}` });
-    }
 
     // resolve coletor
     const coletor_id = await getOrCreateColetorId({
@@ -233,101 +223,111 @@ router.post("/clock", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // carrega apontamentos de hoje
-    const [aps] = await conn.query(
-      `SELECT id, turno_ordem, entrada, saida, origem
+    // 1) Obter último evento do dia
+    const [ult] = await conn.query(
+      `SELECT id, evento, turno_ordem
          FROM apontamentos
-        WHERE empresa_id = ? AND funcionario_id = ? AND data = ?
-        ORDER BY turno_ordem ASC, id ASC`,
+        WHERE empresa_id=? AND funcionario_id=? AND data=?
+        ORDER BY horario DESC, id DESC
+        LIMIT 1`,
       [empresaId, func.id, iso]
     );
 
-    const aberto = aps.find((a) => a.entrada && !a.saida);
-
-    if (aberto) {
-      // ========= fechar turno aberto =========
-      // ATENÇÃO aos triggers: se você bloqueou update de oficiais,
-      // permita alteração de SAÍDA quando OLD.saida IS NULL.
-      await conn.query(
-        `UPDATE apontamentos
-            SET saida = ?, dt_gravacao = ?, tz = ?
-          WHERE id = ?`,
-        [entradaHHMM, dtGrav, tz, aberto.id]
-      );
-      await conn.commit();
-      return res.json({ ok: true, action: "saida", id: aberto.id, saida: entradaHHMM });
+    // 2) Decidir próximo evento e turno_ordem
+    let proximoEvento, turno_ordem;
+    if (ult.length && ult[0].evento === "ENTRADA") {
+      // Último foi ENTRADA -> próximo é SAIDA no MESMO turno
+      proximoEvento = "SAIDA";
+      turno_ordem = Number(ult[0].turno_ordem) || 1;
     } else {
-      // ========= criar novo turno (entrada) =========
-      const maxTurno = aps.reduce((m, a) => Math.max(m, Number(a.turno_ordem || 1)), 0) || 0;
-
-      // previne duplicidade lógica do mesmo turno/origem
-      const [dup] = await conn.query(
-        `SELECT id FROM apontamentos
-          WHERE empresa_id = ? AND funcionario_id = ? AND data = ? AND turno_ordem = ? AND origem = ?`,
-        [empresaId, func.id, iso, maxTurno + 1, origem]
+      // Último foi SAIDA (ou não havia eventos) -> abrir novo turno com ENTRADA
+      proximoEvento = "ENTRADA";
+      const [mx] = await conn.query(
+        `SELECT COALESCE(MAX(turno_ordem),0) AS m
+           FROM apontamentos
+          WHERE empresa_id=? AND funcionario_id=? AND data=?`,
+        [empresaId, func.id, iso]
       );
-      if (dup.length) {
-        throw new Error("Já existe um apontamento para este turno.");
-      }
-
-      // NSR: pode ficar NULL aqui; normalmente é atribuído por gerador AFD (marcações)
-      const nsr = null;
-
-      // calcula hash com campos canônicos (mesmo com nsr nulo)
-      const hash_sha256 = calcHash({
-        estabelecimento_cnpj: cnpj14,
-        funcionario_id: func.id,
-        nsr,
-        dt_marcacao: dtMarc,
-        tz,
-        dt_gravacao: dtGrav,
-        coletor_id,
-      });
-
-      const [ins] = await conn.query(
-        `INSERT INTO apontamentos
-           (empresa_id, funcionario_id, data, turno_ordem,
-            entrada, saida, origem,
-            is_rep_oficial,
-            estabelecimento_cnpj, nsr,
-            tz, dt_marcacao, dt_gravacao, coletor_id, hash_sha256,
-            status_tratamento, obs)
-         VALUES (?,?,?,?,?,
-                 ?,?,
-                 1,
-                 ?,?,
-                 ?,?,?,?,?,
-                 'VALIDA', NULL)`,
-        [
-          empresaId, func.id, iso, maxTurno + 1,
-          entradaHHMM, null, origem,
-          cnpj14, nsr,
-          tz, dtMarc, dtGrav, coletor_id, hash_sha256,
-        ]
-      );
-
-      await conn.commit();
-      return res.json({
-        ok: true,
-        action: "entrada",
-        id: ins.insertId,
-        entrada: entradaHHMM,
-        turno_ordem: maxTurno + 1,
-      });
+      turno_ordem = Number(mx[0]?.m || 0) + 1;
     }
+
+    // 3) Alocar NSR por CNPJ (rep_nsr) — obrigatório em batida oficial
+    let nsr = null;
+    if (cnpj14) {
+      const [row] = await conn.query(
+        `SELECT proximo_nsr FROM rep_nsr WHERE estabelecimento_cnpj=? FOR UPDATE`,
+        [cnpj14]
+      );
+      if (row.length === 0) {
+        await conn.query(
+          `INSERT INTO rep_nsr (estabelecimento_cnpj, proximo_nsr) VALUES (?, 1)`,
+          [cnpj14]
+        );
+        nsr = 1;
+        await conn.query(
+          `UPDATE rep_nsr SET proximo_nsr = proximo_nsr + 1 WHERE estabelecimento_cnpj=?`,
+          [cnpj14]
+        );
+      } else {
+        nsr = Number(row[0].proximo_nsr);
+        await conn.query(
+          `UPDATE rep_nsr SET proximo_nsr = proximo_nsr + 1 WHERE estabelecimento_cnpj=?`,
+          [cnpj14]
+        );
+      }
+    }
+
+    // 4) Hash de integridade
+    const hash_sha256 = calcHash({
+      estabelecimento_cnpj: cnpj14,
+      funcionario_id: func.id,
+      nsr,
+      dt_marcacao: dtMarc,
+      tz,
+      dt_gravacao: dtGrav,
+      coletor_id,
+    });
+
+    // 5) Inserir evento (INSERT sempre)
+    const [ins] = await conn.query(
+      `INSERT INTO apontamentos
+         (empresa_id, estabelecimento_cnpj, is_rep_oficial, nsr,
+          dt_marcacao, tz, dt_gravacao, coletor_id, hash_sha256,
+          funcionario_id, data, turno_ordem, evento, horario,
+          origem, status_tratamento, origem_nsr_ref, obs)
+       VALUES (?,?,?,?, ?,?,?,?,?,
+               ?,?,?,?, ?,?, 'VALIDA', NULL, NULL)`,
+      [
+        empresaId, cnpj14, 1, nsr,
+        dtMarc, tz, dtGrav, coletor_id, hash_sha256,
+        func.id, iso, turno_ordem, proximoEvento, hhmm,
+        origem
+      ]
+    );
+
+    await conn.commit();
+    return res.json({
+      ok: true,
+      action: proximoEvento.toLowerCase(),
+      id: ins.insertId,
+      evento: proximoEvento,
+      horario: hhmm,
+      turno_ordem,
+      nsr,
+    });
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("DASH_FUNC_CLOCK_ERR", e);
     const msg = String(e?.message || "");
-    // 45000 = erro de trigger custom (ex.: imutabilidade). Informe melhor:
     if (msg.includes("imutável") || msg.includes("PTRP") || msg.includes("TRIGGER")) {
       return res.status(405).json({
         ok: false,
-        error: "Política de imutabilidade do apontamento oficial bloqueou a operação. Ajuste o trigger para permitir preencher a saída quando ela estiver vazia (OLD.saida IS NULL).",
+        error:
+          "Política de imutabilidade bloqueou a operação. Em oficiais, use INSERT-only; ajustes via PTRP.",
       });
     }
     if (/Duplicate entry/i.test(msg)) {
-      return res.status(409).json({ ok: false, error: "Conflito de duplicidade: já existe um registro igual." });
+      return res.status(409).json({ ok: false, error: "Conflito de duplicidade." });
     }
     return res.status(400).json({ ok: false, error: msg || "Falha ao registrar ponto." });
   } finally {
