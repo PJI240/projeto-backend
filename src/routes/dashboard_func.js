@@ -1,3 +1,4 @@
+// src/routes/dashboard_func.js
 import { Router } from "express";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
@@ -41,11 +42,10 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
 }
 
 const pad2 = (n) => String(n).padStart(2, "0");
-function nowUtc() {
-  return new Date(); // servidor em UTC
-}
+function nowUtc() { return new Date(); } // servidor em UTC
+
 function brDateISO(d = new Date()) {
-  // YYYY-MM-DD com base em America/Sao_Paulo (UTC-3 simplificado)
+  // YYYY-MM-DD baseado em America/Sao_Paulo (UTC-3 simplificado)
   const tzOffsetMin = -3 * 60;
   const dd = new Date(d.getTime());
   dd.setMinutes(dd.getMinutes() + dd.getTimezoneOffset() + tzOffsetMin);
@@ -139,6 +139,30 @@ function calcHash({ estabelecimento_cnpj, funcionario_id, nsr, dt_marcacao, tz, 
   return crypto.createHash("sha256").update(parts.join("|")).digest("hex");
 }
 
+/* ========= alocação de NSR por CNPJ (seguro p/ concorrência) ========= */
+async function allocNsr(conn, cnpj14) {
+  if (!cnpj14) return null;
+  const cnpj = String(cnpj14).replace(/\D/g, "").padStart(14, "0").slice(-14);
+
+  // garante linha; UNIQUE(estabelecimento_cnpj)
+  await conn.query(
+    `INSERT IGNORE INTO rep_nsr (estabelecimento_cnpj, proximo_nsr) VALUES (?, 1)`,
+    [cnpj]
+  );
+
+  const [[row]] = await conn.query(
+    `SELECT proximo_nsr FROM rep_nsr WHERE estabelecimento_cnpj = ? FOR UPDATE`,
+    [cnpj]
+  );
+
+  const nsrAtual = Number(row?.proximo_nsr || 1);
+  await conn.query(
+    `UPDATE rep_nsr SET proximo_nsr = proximo_nsr + 1 WHERE estabelecimento_cnpj = ?`,
+    [cnpj]
+  );
+  return nsrAtual;
+}
+
 /* ========== GET /api/dashboard_func/hoje ========== */
 router.get("/hoje", requireAuth, async (req, res) => {
   try {
@@ -158,6 +182,7 @@ router.get("/hoje", requireAuth, async (req, res) => {
       [empresaId, func.id, iso]
     );
 
+    // evento por linha (ENTRADA/SAIDA)
     const [evs] = await pool.query(
       `
         SELECT id, turno_ordem, evento, horario, origem, is_rep_oficial, status_tratamento,
@@ -192,7 +217,7 @@ router.get("/hoje", requireAuth, async (req, res) => {
  * Body esperado (do front):
  * {
  *   empresa_id?: number,
- *   origem?: "APONTADO",         // será forçado para APONTADO (oficial)
+ *   origem?: "APONTADO",         // forçado p/ APONTADO (oficial)
  *   tz?: "America/Sao_Paulo",
  *   coletor_identificador?: "web:platform:ua",
  *   coletor_versao?: "x.y.z"
@@ -207,13 +232,12 @@ router.post("/clock", requireAuth, async (req, res) => {
 
     const tz = String(req.body?.tz || "America/Sao_Paulo");
     const origem = "APONTADO"; // oficial
-    const iso = brDateISO();   // data-base local
-    const hhmm = hhmmNowBR();
-    const dtMarc = nowUtc();
-    const dtGrav = nowUtc();
+    const iso = brDateISO();         // data-base local (BR)
+    const hhmm = hhmmNowBR();        // HH:MM local (BR)
+    const dtMarc = nowUtc();         // data/hora percebida no momento (UTC)
+    const dtGrav = nowUtc();         // data/hora da gravação (UTC)
     const cnpj14 = String(func.empresa_cnpj || "").replace(/\D/g, "").padStart(14, "0").slice(-14) || null;
 
-    // resolve coletor
     const coletor_id = await getOrCreateColetorId({
       empresaId,
       identificador: req.body?.coletor_identificador,
@@ -223,7 +247,7 @@ router.post("/clock", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // 1) Obter último evento do dia
+    // 1) Qual foi o último evento do dia?
     const [ult] = await conn.query(
       `SELECT id, evento, turno_ordem
          FROM apontamentos
@@ -233,49 +257,26 @@ router.post("/clock", requireAuth, async (req, res) => {
       [empresaId, func.id, iso]
     );
 
-    // 2) Decidir próximo evento e turno_ordem
+    // 2) Decidir próximo evento/turno
     let proximoEvento, turno_ordem;
     if (ult.length && ult[0].evento === "ENTRADA") {
-      // Último foi ENTRADA -> próximo é SAIDA no MESMO turno
+      // próximo é SAIDA no mesmo turno
       proximoEvento = "SAIDA";
       turno_ordem = Number(ult[0].turno_ordem) || 1;
     } else {
-      // Último foi SAIDA (ou não havia eventos) -> abrir novo turno com ENTRADA
+      // sem eventos ou último foi SAIDA → abrir novo turno
       proximoEvento = "ENTRADA";
-      const [mx] = await conn.query(
+      const [[mx]] = await conn.query(
         `SELECT COALESCE(MAX(turno_ordem),0) AS m
            FROM apontamentos
           WHERE empresa_id=? AND funcionario_id=? AND data=?`,
         [empresaId, func.id, iso]
       );
-      turno_ordem = Number(mx[0]?.m || 0) + 1;
+      turno_ordem = Number(mx?.m || 0) + 1;
     }
 
-    // 3) Alocar NSR por CNPJ (rep_nsr) — obrigatório em batida oficial
-    let nsr = null;
-    if (cnpj14) {
-      const [row] = await conn.query(
-        `SELECT proximo_nsr FROM rep_nsr WHERE estabelecimento_cnpj=? FOR UPDATE`,
-        [cnpj14]
-      );
-      if (row.length === 0) {
-        await conn.query(
-          `INSERT INTO rep_nsr (estabelecimento_cnpj, proximo_nsr) VALUES (?, 1)`,
-          [cnpj14]
-        );
-        nsr = 1;
-        await conn.query(
-          `UPDATE rep_nsr SET proximo_nsr = proximo_nsr + 1 WHERE estabelecimento_cnpj=?`,
-          [cnpj14]
-        );
-      } else {
-        nsr = Number(row[0].proximo_nsr);
-        await conn.query(
-          `UPDATE rep_nsr SET proximo_nsr = proximo_nsr + 1 WHERE estabelecimento_cnpj=?`,
-          [cnpj14]
-        );
-      }
-    }
+    // 3) Alocar NSR oficial na batida
+    const nsr = await allocNsr(conn, cnpj14);
 
     // 4) Hash de integridade
     const hash_sha256 = calcHash({
@@ -288,7 +289,7 @@ router.post("/clock", requireAuth, async (req, res) => {
       coletor_id,
     });
 
-    // 5) Inserir evento (INSERT sempre)
+    // 5) Inserir evento (INSERT sempre; oficiais são imutáveis)
     const [ins] = await conn.query(
       `INSERT INTO apontamentos
          (empresa_id, estabelecimento_cnpj, is_rep_oficial, nsr,
@@ -322,8 +323,7 @@ router.post("/clock", requireAuth, async (req, res) => {
     if (msg.includes("imutável") || msg.includes("PTRP") || msg.includes("TRIGGER")) {
       return res.status(405).json({
         ok: false,
-        error:
-          "Política de imutabilidade bloqueou a operação. Em oficiais, use INSERT-only; ajustes via PTRP.",
+        error: "Política de imutabilidade bloqueou a operação. Em oficiais, usamos INSERT-only; ajustes via PTRP.",
       });
     }
     if (/Duplicate entry/i.test(msg)) {
