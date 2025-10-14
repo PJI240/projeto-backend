@@ -50,10 +50,10 @@ async function fetchEscalas(empresaIds, from, to, apenasAtivos) {
     SELECT e.id,
            e.empresa_id,
            e.funcionario_id,
-           DATE_FORMAT(e.data, '%Y-%m-%d')    AS data,
+           DATE_FORMAT(e.data, '%Y-%m-%d') AS data,
            e.turno_ordem,
-           TIME_FORMAT(e.entrada, '%H:%i')     AS entrada,
-           TIME_FORMAT(e.saida,   '%H:%i')     AS saida,
+           TIME_FORMAT(e.entrada, '%H:%i')  AS entrada,
+           TIME_FORMAT(e.saida,   '%H:%i')  AS saida,
            e.origem
       FROM escalas e
       JOIN funcionarios f ON f.id = e.funcionario_id
@@ -71,24 +71,57 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
   if (!empresaIds.length) return [];
   const [rows] = await pool.query(
     `
+    WITH ev AS (
+      SELECT
+        a.funcionario_id,
+        a.turno_ordem,
+        DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'), '%Y-%m-%d') AS data,
+        UPPER(a.evento) AS evento,
+        DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'), '%H:%i') AS hhmm,
+        CASE UPPER(TRIM(a.origem))
+          WHEN 'AJUSTE' THEN 3
+          WHEN 'IMPORTADO' THEN 2
+          WHEN 'APONTADO' THEN 1
+          ELSE 0
+        END AS prio
+      FROM apontamentos a
+      JOIN funcionarios f ON f.id = a.funcionario_id
+      WHERE f.empresa_id IN (?)
+        ${apenasAtivos ? "AND f.ativo = 1" : ""}
+        AND DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'), '%Y-%m-%d') BETWEEN ? AND ?
+    ),
+    ent AS (
+      SELECT data, funcionario_id, turno_ordem,
+             MIN(hhmm) AS entrada,
+             MAX(prio) AS prio_ent
+      FROM ev
+      WHERE evento='ENTRADA'
+      GROUP BY data, funcionario_id, turno_ordem
+    ),
+    sai AS (
+      SELECT data, funcionario_id, turno_ordem,
+             MAX(hhmm) AS saida,
+             MAX(prio) AS prio_sai
+      FROM ev
+      WHERE evento='SAIDA'
+      GROUP BY data, funcionario_id, turno_ordem
+    )
     SELECT
-      a.funcionario_id,
-      DATE_FORMAT(a.data, '%Y-%m-%d') AS data,
-      a.turno_ordem,
-      TIME_FORMAT(MIN(CASE WHEN UPPER(a.evento)='ENTRADA' THEN a.horario END), '%H:%i') AS entrada,
-      TIME_FORMAT(MAX(CASE WHEN UPPER(a.evento)='SAIDA'   THEN a.horario END), '%H:%i') AS saida,
+      e.data,
+      e.funcionario_id,
+      e.turno_ordem,
+      e.entrada,
+      s.saida,
       CASE
-        WHEN MAX(CASE UPPER(TRIM(a.origem)) WHEN 'AJUSTE' THEN 3 WHEN 'IMPORTADO' THEN 2 WHEN 'APONTADO' THEN 1 ELSE 0 END)=3 THEN 'AJUSTE'
-        WHEN MAX(CASE UPPER(TRIM(a.origem)) WHEN 'AJUSTE' THEN 3 WHEN 'IMPORTADO' THEN 2 WHEN 'APONTADO' THEN 1 ELSE 0 END)=2 THEN 'IMPORTADO'
-        ELSE 'APONTADO'
+        WHEN COALESCE(s.prio_sai,0) >= COALESCE(e.prio_ent,0) THEN
+          CASE s.prio_sai WHEN 3 THEN 'AJUSTE' WHEN 2 THEN 'IMPORTADO' WHEN 1 THEN 'APONTADO' ELSE 'APONTADO' END
+        ELSE
+          CASE e.prio_ent WHEN 3 THEN 'AJUSTE' WHEN 2 THEN 'IMPORTADO' WHEN 1 THEN 'APONTADO' ELSE 'APONTADO' END
       END AS origem
-    FROM apontamentos a
-    JOIN funcionarios f ON f.id = a.funcionario_id
-    WHERE f.empresa_id IN (?)
-      ${apenasAtivos ? "AND f.ativo = 1" : ""}
-      AND a.data BETWEEN ? AND ?
-    GROUP BY a.data, a.funcionario_id, a.turno_ordem
-    ORDER BY a.data ASC, a.funcionario_id ASC, a.turno_ordem ASC
+    FROM ent e
+    LEFT JOIN sai s
+      ON s.data=e.data AND s.funcionario_id=e.funcionario_id AND s.turno_ordem=e.turno_ordem
+    ORDER BY e.data ASC, e.funcionario_id ASC, e.turno_ordem ASC
     `,
     [empresaIds, from, to]
   );
@@ -98,23 +131,18 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
 router.get("/dashboard/adm", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
-    if (!empresaIds.length) {
-      return res.json({ funcionarios: [], escalas: [], apontamentos: [], period: null });
-    }
-
+    if (!empresaIds.length) return res.json({ funcionarios: [], escalas: [], apontamentos: [], period: null });
     const apenasAtivos = String(req.query.ativos || "0") === "1";
     const data = (req.query.data || "").trim();
     let from = (req.query.from || "").trim();
     let to   = (req.query.to   || "").trim();
     if (data) { from = data; to = data; }
     if (!from || !to) ({ from, to } = weekRange());
-
     const [funcionarios, escalas, apontamentos] = await Promise.all([
       fetchFuncionarios(empresaIds, apenasAtivos),
       fetchEscalas(empresaIds, from, to, apenasAtivos),
       fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos),
     ]);
-
     return res.json({ funcionarios, escalas, apontamentos, period: { from, to } });
   } catch (e) {
     console.error("GET /api/dashboard/adm error:", e);
@@ -138,11 +166,9 @@ router.get("/escalas", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
     if (!empresaIds.length) return res.json({ escalas: [] });
-
     let from = (req.query.from || "").trim();
     let to   = (req.query.to   || "").trim();
     if (!from || !to) ({ from, to } = weekRange());
-
     const apenasAtivos = String(req.query.ativos || "0") === "1";
     const escalas = await fetchEscalas(empresaIds, from, to, apenasAtivos);
     res.json({ escalas, period: { from, to } });
@@ -156,11 +182,9 @@ router.get("/apontamentos", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
     if (!empresaIds.length) return res.json({ apontamentos: [] });
-
     let from = (req.query.from || "").trim();
     let to   = (req.query.to   || "").trim();
     if (!from || !to) ({ from, to } = weekRange());
-
     const apenasAtivos = String(req.query.ativos || "0") === "1";
     const apontamentos = await fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos);
     res.json({ apontamentos, period: { from, to } });
@@ -173,16 +197,9 @@ router.get("/apontamentos", mustBeAuthed, async (req, res) => {
 router.get("/dashboard/adm/debug", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
-    if (!empresaIds.length) {
-      return res.json({ empresaIds: [], totals: { funcionarios: 0, escalas: 0, apontamentos: 0 } });
-    }
-
+    if (!empresaIds.length) return res.json({ empresaIds: [], totals: { funcionarios: 0, escalas: 0, apontamentos: 0 } });
     const data = (req.query.data || new Date().toISOString().slice(0, 10)).trim();
-
-    const [[f]] = await pool.query(
-      `SELECT COUNT(*) n FROM funcionarios WHERE empresa_id IN (?)`,
-      [empresaIds]
-    );
+    const [[f]] = await pool.query(`SELECT COUNT(*) n FROM funcionarios WHERE empresa_id IN (?)`, [empresaIds]);
     const [[e]] = await pool.query(
       `
       SELECT COUNT(*) n
@@ -199,11 +216,10 @@ router.get("/dashboard/adm/debug", mustBeAuthed, async (req, res) => {
         FROM apontamentos a
         JOIN funcionarios f ON f.id = a.funcionario_id
        WHERE f.empresa_id IN (?)
-         AND a.data = ?
+         AND DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'),'%Y-%m-%d') = ?
       `,
       [empresaIds, data]
     );
-
     res.json({ data, empresaIds, totals: { funcionarios: f.n, escalas: e.n, apontamentos: ap.n } });
   } catch (e) {
     console.error("GET /api/dashboard/adm/debug error:", e);
