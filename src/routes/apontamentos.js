@@ -112,18 +112,31 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(ev);
     }
 
+    // >>> AQUI: data formatada como string 'YYYY-MM-DD'
     const [rows] = await pool.query(
       `
         SELECT
-          id, empresa_id, funcionario_id, data, turno_ordem,
-          evento, horario, origem, status_tratamento, obs,
-          is_rep_oficial, nsr, tz, dt_marcacao, dt_gravacao, coletor_id
-          -- demais campos ficam disponíveis se você quiser exibir no front
-          FROM apontamentos
-         WHERE empresa_id = ?
-           AND data BETWEEN ? AND ?
-           ${extra}
-         ORDER BY data ASC, funcionario_id ASC, turno_ordem ASC, horario ASC, id ASC
+          id,
+          empresa_id,
+          funcionario_id,
+          DATE_FORMAT(data, '%Y-%m-%d') AS data,
+          turno_ordem,
+          evento,
+          horario,
+          origem,
+          status_tratamento,
+          obs,
+          is_rep_oficial,
+          nsr,
+          tz,
+          dt_marcacao,
+          dt_gravacao,
+          coletor_id
+        FROM apontamentos
+        WHERE empresa_id = ?
+          AND data BETWEEN ? AND ?
+          ${extra}
+        ORDER BY data ASC, funcionario_id ASC, turno_ordem ASC, horario ASC, id ASC
       `,
       params
     );
@@ -170,7 +183,7 @@ router.post("/", requireAuth, async (req, res) => {
 
     await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
 
-    // opcional: prevenir duplicidade lógica do mesmo evento
+    // prevenir duplicidade lógica do mesmo evento
     const [dup] = await conn.query(
       `SELECT id FROM apontamentos
         WHERE empresa_id=? AND funcionario_id=? AND data=?
