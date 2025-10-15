@@ -31,6 +31,11 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+function normTipo(v) {
+  const s = normStr(v);
+  return s ? s.toUpperCase() : null;
+}
+
 /* ===================== helpers auth/scope ===================== */
 
 async function getUserRoles(userId) {
@@ -77,7 +82,6 @@ async function ensureCanAccessFuncionario(userId, funcionarioId) {
   const empresas = await getUserEmpresaIds(userId);
   if (!empresas.length) throw new Error("Acesso negado (sem empresa vinculada).");
 
-  // conferir empresa do funcionário
   const [[row]] = await pool.query(
     `SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`,
     [funcionarioId]
@@ -95,7 +99,6 @@ async function ensureCanAccessOcorrencia(userId, ocorrenciaId) {
   const empresas = await getUserEmpresaIds(userId);
   if (!empresas.length) throw new Error("Acesso negado (sem empresa vinculada).");
 
-  // obtém empresa via join na ocorrência
   const [[row]] = await pool.query(
     `SELECT o.empresa_id
        FROM ocorrencias o
@@ -107,6 +110,84 @@ async function ensureCanAccessOcorrencia(userId, ocorrenciaId) {
   if (empresas.includes(Number(row.empresa_id))) return true;
 
   throw new Error("Ocorrência fora do escopo do usuário.");
+}
+
+/* ===================== validação dinâmica via CHECK do banco ===================== */
+
+// cache simples pra não consultar o INFORMATION_SCHEMA toda hora
+let _ocChkCache = { tipos: null, hasMinHoras0: null, maxHoras: null, loadedAt: 0 };
+
+async function loadOcorrenciasCheckInfo() {
+  const now = Date.now();
+  if (_ocChkCache.loadedAt && now - _ocChkCache.loadedAt < 5 * 60 * 1000) return _ocChkCache;
+
+  const [rows] = await pool.query(
+    `SELECT CHECK_CLAUSE 
+       FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
+      WHERE TABLE_NAME = 'ocorrencias'
+      ORDER BY CONSTRAINT_NAME ASC`
+  );
+
+  const tipos = new Set();
+  let hasMinHoras0 = false;
+  let maxHoras = null;
+
+  for (const r of rows) {
+    const clause = String(r.CHECK_CLAUSE || "");
+
+    // extrai lista de tipos (variações comuns de sintaxe)
+    const mIn = clause.match(/`?tipo`?\s*in\s*\(([^)]+)\)/i);
+    if (mIn) {
+      const inner = mIn[1];
+      const reStr = /'([^']+)'/g;
+      let mm;
+      while ((mm = reStr.exec(inner))) {
+        tipos.add(mm[1]); // mantém como no CHECK (provável MAIÚSCULO)
+      }
+    }
+
+    // horas >= 0
+    if (/`?horas`?\s*>=\s*0/i.test(clause)) hasMinHoras0 = true;
+
+    // horas <= X (se houver)
+    const mMax = clause.match(/`?horas`?\s*<=\s*(\d+(?:\.\d+)?)/i);
+    if (mMax) {
+      const v = Number(mMax[1]);
+      if (Number.isFinite(v)) maxHoras = maxHoras == null ? v : Math.min(maxHoras, v);
+    }
+  }
+
+  _ocChkCache = {
+    tipos: tipos.size ? tipos : null,
+    hasMinHoras0,
+    maxHoras,
+    loadedAt: now,
+  };
+  return _ocChkCache;
+}
+
+// Lança erro amigável quando payload viola o CHECK
+async function validateOcorrenciaPayload({ tipo, horas }) {
+  const chk = await loadOcorrenciasCheckInfo();
+
+  if (chk.tipos) {
+    if (!tipo || !chk.tipos.has(tipo)) {
+      const lista = Array.from(chk.tipos).join(", ");
+      throw new Error(`Tipo inválido. Use um dos valores permitidos: ${lista}.`);
+    }
+  } else {
+    // fallback: se não conseguimos detectar a lista, ao menos exigir não-nulo
+    if (!tipo) throw new Error("Tipo é obrigatório.");
+  }
+
+  if (horas != null) {
+    if (chk.hasMinHoras0 && horas < 0) {
+      throw new Error("Horas não pode ser negativa.");
+    }
+    if (chk.maxHoras != null && horas > chk.maxHoras) {
+      throw new Error(`Horas acima do limite permitido (${chk.maxHoras}).`);
+    }
+  }
 }
 
 /* =========================================================
@@ -140,7 +221,7 @@ router.get("/", async (req, res) => {
     const to   = toDateOrNull(req.query.to)   || padraoTo;
 
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
-    const tipo = normStr(req.query.tipo);
+    const tipo = normTipo(req.query.tipo);
     const q    = normStr(req.query.q);
 
     const limit  = Math.min(200, Math.max(1, Number(req.query.limit || 200)));
@@ -166,7 +247,7 @@ router.get("/", async (req, res) => {
 
     // escopo por empresa (se não-dev)
     if (!dev) {
-      if (!empresasUser.length) return res.json({ ok: true, ocorrencias: [], total: 0 });
+      if (!empresasUser.length) return res.json({ ok: true, ocorrencias: [], total: 0, limit, offset });
       where.push(`o.empresa_id IN (${empresasUser.map(() => "?").join(",")})`);
       params.push(...empresasUser);
     }
@@ -178,7 +259,8 @@ router.get("/", async (req, res) => {
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
     `;
 
-    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${sqlBase}`, params);
+    const [[cnt]] = await pool.query(`SELECT COUNT(*) AS total ${sqlBase}`, params);
+    const total = Number(cnt?.total || 0);
 
     const [rows] = await pool.query(
       `
@@ -207,7 +289,7 @@ router.post("/", async (req, res) => {
   try {
     const funcionario_id = Number(req.body?.funcionario_id);
     const data = toDateOrNull(req.body?.data);
-    const tipo = normStr(req.body?.tipo);
+    const tipo = normTipo(req.body?.tipo);
     const horas = numOrNull(req.body?.horas);
     const obs = normStr(req.body?.obs);
 
@@ -224,11 +306,14 @@ router.post("/", async (req, res) => {
     );
     if (!frow) return res.status(404).json({ ok: false, error: "Funcionário não encontrado." });
 
+    // validação alinhada ao CHECK do banco
+    await validateOcorrenciaPayload({ tipo, horas });
+
     const [ins] = await pool.query(
       `INSERT INTO ocorrencias
          (empresa_id, funcionario_id, data, tipo, horas, obs)
        VALUES (?,?,?,?,?,?)`,
-      [frow.empresa_id, funcionario_id, data, tipo || null, horas, obs]
+      [frow.empresa_id, funcionario_id, data, tipo, horas, obs]
     );
 
     return res.json({ ok: true, id: ins.insertId });
@@ -248,15 +333,15 @@ router.put("/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
+    // garante que a ocorrência atual está no escopo
+    await ensureCanAccessOcorrencia(req.userId, id);
+
     // se trocar o funcionário, precisa poder acessá-lo
     const novoFuncionarioId = req.body?.funcionario_id ? Number(req.body.funcionario_id) : null;
     const data = toDateOrNull(req.body?.data);
-    const tipo = normStr(req.body?.tipo);
-    const horas = numOrNull(req.body?.horas);
-    const obs = normStr(req.body?.obs);
-
-    // garante que a ocorrência atual está no escopo
-    await ensureCanAccessOcorrencia(req.userId, id);
+    const tipoReq = (req.body?.tipo !== undefined) ? normTipo(req.body.tipo) : undefined; // undefined => não alterar
+    const horasReq = (req.body?.horas !== undefined) ? numOrNull(req.body.horas) : undefined;
+    const obs = (req.body?.obs !== undefined) ? normStr(req.body.obs) : undefined;
 
     let empresaIdAlvo = null;
     let funcionarioIdAlvo = null;
@@ -269,20 +354,30 @@ router.put("/:id", async (req, res) => {
       funcionarioIdAlvo = novoFuncionarioId;
     }
 
+    // valida (usa estado atual para compor o conjunto final válido)
+    if (tipoReq !== undefined || horasReq !== undefined) {
+      const [[curr]] = await pool.query(`SELECT tipo, horas FROM ocorrencias WHERE id = ?`, [id]);
+      if (!curr) return res.status(404).json({ ok: false, error: "Ocorrência não encontrada." });
+
+      const tipoFinal = (tipoReq !== undefined) ? tipoReq : (curr.tipo ? String(curr.tipo).toUpperCase() : null);
+      const horasFinal = (horasReq !== undefined) ? horasReq : curr.horas;
+
+      await validateOcorrenciaPayload({ tipo: tipoFinal, horas: horasFinal });
+    }
+
     // monta update dinâmico
     const sets = [];
     const params = [];
     if (empresaIdAlvo != null) { sets.push(`empresa_id = ?`); params.push(empresaIdAlvo); }
     if (funcionarioIdAlvo != null) { sets.push(`funcionario_id = ?`); params.push(funcionarioIdAlvo); }
     if (data != null) { sets.push(`data = ?`); params.push(data); }
-    if (req.body?.tipo !== undefined) { sets.push(`tipo = ?`); params.push(tipo); }
-    if (req.body?.horas !== undefined) { sets.push(`horas = ?`); params.push(horas); }
-    if (req.body?.obs !== undefined) { sets.push(`obs = ?`); params.push(obs); }
+    if (tipoReq !== undefined) { sets.push(`tipo = ?`); params.push(tipoReq); }
+    if (horasReq !== undefined) { sets.push(`horas = ?`); params.push(horasReq); }
+    if (obs !== undefined) { sets.push(`obs = ?`); params.push(obs); }
 
     if (!sets.length) return res.json({ ok: true, changed: 0 });
 
     params.push(id);
-
     await pool.query(`UPDATE ocorrencias SET ${sets.join(", ")} WHERE id = ?`, params);
 
     return res.json({ ok: true });
@@ -301,13 +396,26 @@ router.delete("/:id", async (req, res) => {
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
     await ensureCanAccessOcorrencia(req.userId, id);
-
     await pool.query(`DELETE FROM ocorrencias WHERE id = ?`, [id]);
 
     return res.json({ ok: true });
   } catch (e) {
     console.error("OCORRENCIAS_DELETE_ERR", e);
     return res.status(400).json({ ok: false, error: e.message || "Falha ao excluir ocorrência." });
+  }
+});
+
+/**
+ * (Opcional) GET /api/ocorrencias/tipos
+ * expõe a whitelist de tipos (lida do CHECK) para montar selects no front
+ */
+router.get("/tipos", async (req, res) => {
+  try {
+    const chk = await loadOcorrenciasCheckInfo();
+    const tipos = chk.tipos ? Array.from(chk.tipos).sort() : [];
+    res.json({ ok: true, tipos, minHoras0: !!chk.hasMinHoras0, maxHoras: chk.maxHoras });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message || "Falha ao obter tipos." });
   }
 });
 
