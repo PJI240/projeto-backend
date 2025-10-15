@@ -75,9 +75,9 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
       SELECT
         a.funcionario_id,
         a.turno_ordem,
-        DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'), '%Y-%m-%d') AS data,
+        DATE(a.data) AS data,
         UPPER(a.evento) AS evento,
-        DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'), '%H:%i') AS hhmm,
+        TIME_FORMAT(a.horario, '%H:%i') AS hhmm,
         CASE UPPER(TRIM(a.origem))
           WHEN 'AJUSTE' THEN 3
           WHEN 'IMPORTADO' THEN 2
@@ -88,7 +88,8 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
       JOIN funcionarios f ON f.id = a.funcionario_id
       WHERE f.empresa_id IN (?)
         ${apenasAtivos ? "AND f.ativo = 1" : ""}
-        AND DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'), '%Y-%m-%d') BETWEEN ? AND ?
+        AND a.data BETWEEN ? AND ?
+        AND a.status_tratamento = 'VALIDA'
     ),
     ent AS (
       SELECT data, funcionario_id, turno_ordem,
@@ -121,35 +122,181 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
     FROM ent e
     LEFT JOIN sai s
       ON s.data=e.data AND s.funcionario_id=e.funcionario_id AND s.turno_ordem=e.turno_ordem
-    ORDER BY e.data ASC, e.funcionario_id ASC, e.turno_ordem ASC
+    
+    UNION ALL
+    
+    SELECT
+      s.data,
+      s.funcionario_id,
+      s.turno_ordem,
+      e.entrada,
+      s.saida,
+      CASE
+        WHEN COALESCE(s.prio_sai,0) >= COALESCE(e.prio_ent,0) THEN
+          CASE s.prio_sai WHEN 3 THEN 'AJUSTE' WHEN 2 THEN 'IMPORTADO' WHEN 1 THEN 'APONTADO' ELSE 'APONTADO' END
+        ELSE
+          CASE e.prio_ent WHEN 3 THEN 'AJUSTE' WHEN 2 THEN 'IMPORTADO' WHEN 1 THEN 'APONTADO' ELSE 'APONTADO' END
+      END AS origem
+    FROM sai s
+    LEFT JOIN ent e
+      ON e.data=s.data AND e.funcionario_id=s.funcionario_id AND e.turno_ordem=s.turno_ordem
+    WHERE e.funcionario_id IS NULL
+    
+    ORDER BY data ASC, funcionario_id ASC, turno_ordem ASC
     `,
     [empresaIds, from, to]
   );
   return rows;
 }
 
+// Nova função para calcular métricas do dashboard
+async function calcularMetricasDashboard(funcionarios, escalas, apontamentos, from, to) {
+  const metricas = {
+    totais: {
+      funcionarios: funcionarios.length,
+      presentes: 0,
+      ausentes: 0,
+      atrasos: 0,
+      escalas: escalas.length
+    },
+    diario: {},
+    grafico: {
+      dias: [],
+      presentes: [],
+      ausentes: [],
+      atrasos: []
+    }
+  };
+
+  // Gerar array de datas do período
+  const datas = [];
+  const dataInicio = new Date(from);
+  const dataFim = new Date(to);
+  for (let d = new Date(dataInicio); d <= dataFim; d.setDate(d.getDate() + 1)) {
+    const dataStr = toISO(d);
+    datas.push(dataStr);
+    metricas.diario[dataStr] = { presentes: 0, ausentes: 0, atrasos: 0, escalados: 0 };
+  }
+
+  metricas.grafico.dias = datas.map(d => d.split('-').reverse().join('/'));
+
+  // Calcular escalados por dia
+  escalas.forEach(escala => {
+    if (metricas.diario[escala.data]) {
+      metricas.diario[escala.data].escalados++;
+    }
+  });
+
+  // Calcular presentes, ausentes e atrasos
+  const funcionariosComPresenca = new Set();
+  const funcionariosComAtraso = new Set();
+
+  apontamentos.forEach(ap => {
+    if (metricas.diario[ap.data]) {
+      // Considera presente se tem pelo menos uma entrada
+      if (ap.entrada) {
+        metricas.diario[ap.data].presentes++;
+        funcionariosComPresenca.add(`${ap.funcionario_id}_${ap.data}`);
+        
+        // Verificar atraso comparando com a escala
+        const escalaCorrespondente = escalas.find(e => 
+          e.funcionario_id === ap.funcionario_id && 
+          e.data === ap.data && 
+          e.turno_ordem === ap.turno_ordem
+        );
+        
+        if (escalaCorrespondente && escalaCorrespondente.entrada) {
+          const [entradaH, entradaM] = ap.entrada.split(':').map(Number);
+          const [escalaH, escalaM] = escalaCorrespondente.entrada.split(':').map(Number);
+          
+          const minutosApontamento = entradaH * 60 + entradaM;
+          const minutosEscala = escalaH * 60 + escalaM;
+          
+          // Considera atraso se chegou mais de 5 minutos após o horário da escala
+          if (minutosApontamento > minutosEscala + 5) {
+            metricas.diario[ap.data].atrasos++;
+            funcionariosComAtraso.add(`${ap.funcionario_id}_${ap.data}`);
+          }
+        }
+      }
+    }
+  });
+
+  // Calcular ausentes (escalados mas sem apontamento de entrada)
+  escalas.forEach(escala => {
+    const chave = `${escala.funcionario_id}_${escala.data}`;
+    if (!funcionariosComPresenca.has(chave) && metricas.diario[escala.data]) {
+      metricas.diario[escala.data].ausentes++;
+    }
+  });
+
+  // Consolidar totais e dados do gráfico
+  let totaisPeriodo = { presentes: 0, ausentes: 0, atrasos: 0 };
+  
+  datas.forEach(dataStr => {
+    const dia = metricas.diario[dataStr];
+    totaisPeriodo.presentes += dia.presentes;
+    totaisPeriodo.ausentes += dia.ausentes;
+    totaisPeriodo.atrasos += dia.atrasos;
+    
+    metricas.grafico.presentes.push(dia.presentes);
+    metricas.grafico.ausentes.push(dia.ausentes);
+    metricas.grafico.atrasos.push(dia.atrasos);
+  });
+
+  metricas.totais.presentes = totaisPeriodo.presentes;
+  metricas.totais.ausentes = totaisPeriodo.ausentes;
+  metricas.totais.atrasos = totaisPeriodo.atrasos;
+
+  return metricas;
+}
+
 router.get("/dashboard/adm", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
-    if (!empresaIds.length) return res.json({ funcionarios: [], escalas: [], apontamentos: [], period: null });
-    const apenasAtivos = String(req.query.ativos || "0") === "1";
+    if (!empresaIds.length) return res.json({ 
+      funcionarios: [], 
+      escalas: [], 
+      apontamentos: [], 
+      metricas: null,
+      period: null 
+    });
+    
+    const apenasAtivos = String(req.query.ativos || "1") === "1";
     const data = (req.query.data || "").trim();
     let from = (req.query.from || "").trim();
     let to   = (req.query.to   || "").trim();
-    if (data) { from = data; to = data; }
-    if (!from || !to) ({ from, to } = weekRange());
+    
+    if (data) { 
+      from = data; 
+      to = data; 
+    }
+    if (!from || !to) { 
+      ({ from, to } = weekRange()); 
+    }
+
     const [funcionarios, escalas, apontamentos] = await Promise.all([
       fetchFuncionarios(empresaIds, apenasAtivos),
       fetchEscalas(empresaIds, from, to, apenasAtivos),
       fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos),
     ]);
-    return res.json({ funcionarios, escalas, apontamentos, period: { from, to } });
+
+    const metricas = await calcularMetricasDashboard(funcionarios, escalas, apontamentos, from, to);
+
+    return res.json({ 
+      funcionarios, 
+      escalas, 
+      apontamentos, 
+      metricas,
+      period: { from, to } 
+    });
   } catch (e) {
     console.error("GET /api/dashboard/adm error:", e);
     return res.status(500).json({ ok: false, error: "Falha ao montar dashboard." });
   }
 });
 
+// Mantendo as outras rotas existentes...
 router.get("/funcionarios", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
@@ -191,39 +338,6 @@ router.get("/apontamentos", mustBeAuthed, async (req, res) => {
   } catch (e) {
     console.error("GET /api/apontamentos error:", e);
     res.status(500).json({ ok: false, error: "Falha ao listar apontamentos." });
-  }
-});
-
-router.get("/dashboard/adm/debug", mustBeAuthed, async (req, res) => {
-  try {
-    const empresaIds = await getEmpresaIdsByUser(req.userId);
-    if (!empresaIds.length) return res.json({ empresaIds: [], totals: { funcionarios: 0, escalas: 0, apontamentos: 0 } });
-    const data = (req.query.data || new Date().toISOString().slice(0, 10)).trim();
-    const [[f]] = await pool.query(`SELECT COUNT(*) n FROM funcionarios WHERE empresa_id IN (?)`, [empresaIds]);
-    const [[e]] = await pool.query(
-      `
-      SELECT COUNT(*) n
-        FROM escalas e
-        JOIN funcionarios f ON f.id = e.funcionario_id
-       WHERE f.empresa_id IN (?)
-         AND e.data = ?
-      `,
-      [empresaIds, data]
-    );
-    const [[ap]] = await pool.query(
-      `
-      SELECT COUNT(*) n
-        FROM apontamentos a
-        JOIN funcionarios f ON f.id = a.funcionario_id
-       WHERE f.empresa_id IN (?)
-         AND DATE_FORMAT(CONVERT_TZ(a.dt_marcacao,'UTC','America/Sao_Paulo'),'%Y-%m-%d') = ?
-      `,
-      [empresaIds, data]
-    );
-    res.json({ data, empresaIds, totals: { funcionarios: f.n, escalas: e.n, apontamentos: ap.n } });
-  } catch (e) {
-    console.error("GET /api/dashboard/adm/debug error:", e);
-    res.status(500).json({ ok: false, error: "Falha no debug." });
   }
 });
 
