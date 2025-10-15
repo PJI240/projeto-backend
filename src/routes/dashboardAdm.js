@@ -57,17 +57,19 @@ async function fetchEscalas(empresaIds, from, to, apenasAtivos) {
   if (!empresaIds.length) return [];
   const [rows] = await pool.query(
     `
-    SELECT   e.id,
-  e.empresa_id,
-  e.funcionario_id,
-  DATE_FORMAT(e.data, '%Y-%m-%d') AS data,   -- << aqui
-  e.turno_ordem,
-  TIME_FORMAT(e.entrada, '%H:%i:%s') AS entrada,
-  TIME_FORMAT(e.saida,   '%H:%i:%s') AS saida,
-  e.origem
+    SELECT  e.id,
+            e.empresa_id,
+            e.funcionario_id,
+            DATE_FORMAT(e.data, '%Y-%m-%d')         AS data,
+            e.turno_ordem,
+            TIME_FORMAT(e.entrada, '%H:%i:%s')      AS entrada,
+            TIME_FORMAT(e.saida,   '%H:%i:%s')      AS saida,
+            e.origem
       FROM escalas e
-      JOIN funcionarios f ON f.id = e.funcionario_id
-     WHERE f.empresa_id IN (?)
+      JOIN funcionarios f
+        ON f.id = e.funcionario_id
+       AND f.empresa_id = e.empresa_id
+     WHERE e.empresa_id IN (?)
        ${apenasAtivos ? "AND f.ativo = 1" : ""}
        AND e.data BETWEEN ? AND ?
      ORDER BY e.data ASC, e.funcionario_id ASC, e.turno_ordem ASC
@@ -81,17 +83,23 @@ async function fetchApontamentos(empresaIds, from, to, apenasAtivos) {
   if (!empresaIds.length) return [];
   const [rows] = await pool.query(
     `
-    SELECT   a.id,
-  a.funcionario_id,
-  DATE_FORMAT(a.data, '%Y-%m-%d') AS data,   -- << aqui
-  a.turno_ordem,
-  TIME_FORMAT(a.entrada, '%H:%i:%s') AS entrada,
-  TIME_FORMAT(a.saida,   '%H:%i:%s') AS saida,
-  UPPER(TRIM(a.origem)) AS origem,
-  a.obs
+    SELECT  a.id,
+            a.empresa_id,
+            a.funcionario_id,
+            DATE_FORMAT(a.data, '%Y-%m-%d')         AS data,
+            a.turno_ordem,
+            TIME_FORMAT(a.entrada, '%H:%i:%s')      AS entrada,
+            TIME_FORMAT(a.saida,   '%H:%i:%s')      AS saida,
+            UPPER(TRIM(a.origem))                   AS origem,
+            a.evento,
+            TIME_FORMAT(a.horario, '%H:%i:%s')      AS horario,
+            a.status_tratamento,
+            a.obs
       FROM apontamentos a
-      JOIN funcionarios f ON f.id = a.funcionario_id
-     WHERE f.empresa_id IN (?)
+      JOIN funcionarios f
+        ON f.id = a.funcionario_id
+       AND f.empresa_id = a.empresa_id
+     WHERE a.empresa_id IN (?)
        ${apenasAtivos ? "AND f.ativo = 1" : ""}
        AND a.data BETWEEN ? AND ?
      ORDER BY a.data ASC, a.funcionario_id ASC, a.turno_ordem ASC, a.origem ASC
@@ -191,25 +199,42 @@ router.get("/apontamentos", mustBeAuthed, async (req, res) => {
 router.get("/dashboard/adm/debug", mustBeAuthed, async (req, res) => {
   try {
     const empresaIds = await getEmpresaIdsByUser(req.userId);
-    if (!empresaIds.length) return res.json({ empresaIds: [], totals: { funcionarios: 0, escalas: 0, apontamentos: 0 } });
+    if (!empresaIds.length) {
+      return res.json({ empresaIds: [], totals: { funcionarios: 0, escalas: 0, apontamentos: 0 } });
+    }
 
     const data = (req.query.data || new Date().toISOString().slice(0,10)).trim();
 
-    const [[f]]  = await pool.query(`SELECT COUNT(*) n FROM funcionarios WHERE empresa_id IN (?)`, [empresaIds]);
-    const [[e]]  = await pool.query(`
+    const [[f]]  = await pool.query(
+      `SELECT COUNT(*) n FROM funcionarios WHERE empresa_id IN (?)`,
+      [empresaIds]
+    );
+
+    const [[e]]  = await pool.query(
+      `
       SELECT COUNT(*) n
         FROM escalas e
-        JOIN funcionarios f ON f.id = e.funcionario_id
-       WHERE f.empresa_id IN (?)
+        JOIN funcionarios f
+          ON f.id = e.funcionario_id
+         AND f.empresa_id = e.empresa_id
+       WHERE e.empresa_id IN (?)
          AND e.data = ?
-    `, [empresaIds, data]);
-    const [[ap]] = await pool.query(`
+      `,
+      [empresaIds, data]
+    );
+
+    const [[ap]] = await pool.query(
+      `
       SELECT COUNT(*) n
         FROM apontamentos a
-        JOIN funcionarios f ON f.id = a.funcionario_id
-       WHERE f.empresa_id IN (?)
+        JOIN funcionarios f
+          ON f.id = a.funcionario_id
+         AND f.empresa_id = a.empresa_id
+       WHERE a.empresa_id IN (?)
          AND a.data = ?
-    `, [empresaIds, data]);
+      `,
+      [empresaIds, data]
+    );
 
     res.json({ data, empresaIds, totals: { funcionarios: f.n, escalas: e.n, apontamentos: ap.n } });
   } catch (e) {
