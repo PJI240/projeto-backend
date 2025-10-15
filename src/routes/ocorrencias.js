@@ -5,7 +5,7 @@ import { pool } from "../db.js";
 
 const router = express.Router();
 
-/* ===================== helpers genéricos ===================== */
+/* ===================== utils ===================== */
 
 const onlyDigits = (s = "") => (s || "").replace(/\D+/g, "");
 
@@ -31,12 +31,18 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-function normTipo(v) {
-  const s = normStr(v);
-  return s ? s.toUpperCase() : null;
+/* === TIPOS permitidos & sanitização === */
+const TIPOS_PERMITIDOS = ["FERIADO","ATESTADO","FALTA","FOLGA","OUTRO"];
+const TIPOS_MSG = TIPOS_PERMITIDOS.join(", ");
+
+function cleanTipo(input) {
+  if (input == null) return null;
+  // remove barras invertidas, normaliza espaços e caixa
+  const s = String(input).replace(/\\+/g, "").trim().toUpperCase();
+  return TIPOS_PERMITIDOS.includes(s) ? s : null;
 }
 
-/* ===================== helpers auth/scope ===================== */
+/* ===================== auth / escopo ===================== */
 
 async function getUserRoles(userId) {
   const [rows] = await pool.query(
@@ -112,99 +118,19 @@ async function ensureCanAccessOcorrencia(userId, ocorrenciaId) {
   throw new Error("Ocorrência fora do escopo do usuário.");
 }
 
-/* ===================== validação dinâmica via CHECK do banco ===================== */
-
-// cache simples pra não consultar o INFORMATION_SCHEMA toda hora
-let _ocChkCache = { tipos: null, hasMinHoras0: null, maxHoras: null, loadedAt: 0 };
-
-async function loadOcorrenciasCheckInfo() {
-  const now = Date.now();
-  if (_ocChkCache.loadedAt && now - _ocChkCache.loadedAt < 5 * 60 * 1000) return _ocChkCache;
-
-  // Em MySQL/MariaDB, TABLE_NAME não está em CHECK_CONSTRAINTS.
-  // Precisamos JOIN com TABLE_CONSTRAINTS e filtrar pelo schema atual (DATABASE()).
-  const [rows] = await pool.query(
-    `
-    SELECT cc.CHECK_CLAUSE
-      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-      JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS cc
-        ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-       AND cc.CONSTRAINT_NAME  = tc.CONSTRAINT_NAME
-     WHERE tc.TABLE_SCHEMA = DATABASE()
-       AND tc.TABLE_NAME   = 'ocorrencias'
-       AND tc.CONSTRAINT_TYPE = 'CHECK'
-     ORDER BY tc.CONSTRAINT_NAME ASC
-    `
-  );
-
-  const tipos = new Set();
-  let hasMinHoras0 = false;
-  let maxHoras = null;
-
-  for (const r of rows) {
-    const clause = String(r.CHECK_CLAUSE || "");
-
-    // Extrai lista de tipos do IN(...)
-    const mIn = clause.match(/`?tipo`?\s*in\s*\(([^)]+)\)/i);
-    if (mIn) {
-      const inner = mIn[1];
-      const reStr = /'([^']+)'/g;
-      let mm;
-      while ((mm = reStr.exec(inner))) {
-        tipos.add(mm[1]); // mantém como definido no CHECK (geralmente MAIÚSCULO)
-      }
-    }
-
-    // horas >= 0
-    if (/`?horas`?\s*>=\s*0/i.test(clause)) hasMinHoras0 = true;
-
-    // horas <= X (se existir)
-    const mMax = clause.match(/`?horas`?\s*<=\s*(\d+(?:\.\d+)?)/i);
-    if (mMax) {
-      const v = Number(mMax[1]);
-      if (Number.isFinite(v)) maxHoras = maxHoras == null ? v : Math.min(maxHoras, v);
-    }
-  }
-
-  _ocChkCache = {
-    tipos: tipos.size ? tipos : null,
-    hasMinHoras0,
-    maxHoras,
-    loadedAt: now,
-  };
-
-  return _ocChkCache;
-}
-
-// Lança erro amigável quando payload viola o CHECK
-async function validateOcorrenciaPayload({ tipo, horas }) {
-  const chk = await loadOcorrenciasCheckInfo();
-
-  if (chk.tipos) {
-    if (!tipo || !chk.tipos.has(tipo)) {
-      const lista = Array.from(chk.tipos).join(", ");
-      throw new Error(`Tipo inválido. Use um dos valores permitidos: ${lista}.`);
-    }
-  } else {
-    // fallback: se não conseguimos detectar a lista, ao menos exigir não-nulo
-    if (!tipo) throw new Error("Tipo é obrigatório.");
-  }
-
-  if (horas != null) {
-    if (chk.hasMinHoras0 && horas < 0) {
-      throw new Error("Horas não pode ser negativa.");
-    }
-    if (chk.maxHoras != null && horas > chk.maxHoras) {
-      throw new Error(`Horas acima do limite permitido (${chk.maxHoras}).`);
-    }
-  }
-}
-
-/* =========================================================
-   ROTAS PROTEGIDAS
-   ========================================================= */
+/* ===================== middlewares ===================== */
 
 router.use(requireAuth);
+
+/* ===================== endpoints ===================== */
+
+/**
+ * GET /api/ocorrencias/tipos
+ * Lista de tipos permitidos (sem escapes).
+ */
+router.get("/tipos", async (_req, res) => {
+  return res.json({ ok: true, tipos: TIPOS_PERMITIDOS });
+});
 
 /**
  * GET /api/ocorrencias
@@ -223,15 +149,15 @@ router.get("/", async (req, res) => {
 
     // período padrão = últimos 30 dias
     const now = new Date();
-    const padraoTo   = toDateOrNull(`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`);
+    const padraoTo   = toISO(now);
     const past       = new Date(now); past.setDate(past.getDate() - 30);
-    const padraoFrom = toDateOrNull(`${past.getFullYear()}-${String(past.getMonth()+1).padStart(2,"0")}-${String(past.getDate()).padStart(2,"0")}`);
+    const padraoFrom = toISO(past);
 
     const from = toDateOrNull(req.query.from) || padraoFrom;
     const to   = toDateOrNull(req.query.to)   || padraoTo;
 
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
-    const tipo = normTipo(req.query.tipo);
+    const tipoQuery = cleanTipo(req.query.tipo); // só aceita se for permitido
     const q    = normStr(req.query.q);
 
     const limit  = Math.min(200, Math.max(1, Number(req.query.limit || 200)));
@@ -244,7 +170,7 @@ router.get("/", async (req, res) => {
     if (to)   { where.push(`o.data <= ?`); params.push(to); }
 
     if (funcionarioId) { where.push(`o.funcionario_id = ?`); params.push(funcionarioId); }
-    if (tipo)          { where.push(`UPPER(o.tipo) = UPPER(?)`); params.push(tipo); }
+    if (tipoQuery)     { where.push(`o.tipo = ?`); params.push(tipoQuery); }
 
     if (q) {
       where.push(`(
@@ -255,9 +181,8 @@ router.get("/", async (req, res) => {
       params.push(q, q, q);
     }
 
-    // escopo por empresa (se não-dev)
     if (!dev) {
-      if (!empresasUser.length) return res.json({ ok: true, ocorrencias: [], total: 0, limit, offset });
+      if (!empresasUser.length) return res.json({ ok: true, ocorrencias: [], total: 0 });
       where.push(`o.empresa_id IN (${empresasUser.map(() => "?").join(",")})`);
       params.push(...empresasUser);
     }
@@ -269,8 +194,7 @@ router.get("/", async (req, res) => {
       ${where.length ? "WHERE " + where.join(" AND ") : ""}
     `;
 
-    const [[cnt]] = await pool.query(`SELECT COUNT(*) AS total ${sqlBase}`, params);
-    const total = Number(cnt?.total || 0);
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${sqlBase}`, params);
 
     const [rows] = await pool.query(
       `
@@ -291,39 +215,54 @@ router.get("/", async (req, res) => {
   }
 });
 
+/* ---------- validação payload comum ---------- */
+function validateOcorrenciaPayload({ funcionario_id, data, tipo, horas, obs }) {
+  const funcionarioId = Number(funcionario_id);
+  const dataISO = toDateOrNull(data);
+  const tipoClean = cleanTipo(tipo); // <- sanitiza e valida
+  const horasVal = numOrNull(horas);
+  const obsVal = normStr(obs);
+
+  if (!funcionarioId || !dataISO) {
+    throw new Error("Funcionário e data são obrigatórios.");
+  }
+  if (tipo != null && !tipoClean) {
+    // tipo foi enviado mas não pertence ao whitelist
+    throw new Error(`Tipo inválido. Use um dos valores permitidos: ${TIPOS_MSG}.`);
+  }
+
+  return {
+    funcionarioId,
+    dataISO,
+    tipoClean: tipoClean ?? null, // pode ser null (campo opcional)
+    horasVal,
+    obsVal,
+  };
+}
+
 /**
  * POST /api/ocorrencias
  * body: { funcionario_id, data, tipo, horas, obs }
  */
 router.post("/", async (req, res) => {
   try {
-    const funcionario_id = Number(req.body?.funcionario_id);
-    const data = toDateOrNull(req.body?.data);
-    const tipo = normTipo(req.body?.tipo);
-    const horas = numOrNull(req.body?.horas);
-    const obs = normStr(req.body?.obs);
+    const { funcionarioId, dataISO, tipoClean, horasVal, obsVal } =
+      validateOcorrenciaPayload(req.body || {});
 
-    if (!funcionario_id || !data) {
-      return res.status(400).json({ ok: false, error: "funcionário e data são obrigatórios." });
-    }
-
-    await ensureCanAccessFuncionario(req.userId, funcionario_id);
+    await ensureCanAccessFuncionario(req.userId, funcionarioId);
 
     // empresa do funcionário
     const [[frow]] = await pool.query(
       `SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`,
-      [funcionario_id]
+      [funcionarioId]
     );
     if (!frow) return res.status(404).json({ ok: false, error: "Funcionário não encontrado." });
-
-    // validação alinhada ao CHECK do banco
-    await validateOcorrenciaPayload({ tipo, horas });
 
     const [ins] = await pool.query(
       `INSERT INTO ocorrencias
          (empresa_id, funcionario_id, data, tipo, horas, obs)
        VALUES (?,?,?,?,?,?)`,
-      [frow.empresa_id, funcionario_id, data, tipo, horas, obs]
+      [frow.empresa_id, funcionarioId, dataISO, tipoClean, horasVal, obsVal]
     );
 
     return res.json({ ok: true, id: ins.insertId });
@@ -343,47 +282,54 @@ router.put("/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
-    // garante que a ocorrência atual está no escopo
     await ensureCanAccessOcorrencia(req.userId, id);
 
-    // se trocar o funcionário, precisa poder acessá-lo
-    const novoFuncionarioId = req.body?.funcionario_id ? Number(req.body.funcionario_id) : null;
-    const data = toDateOrNull(req.body?.data);
-    const tipoReq = (req.body?.tipo !== undefined) ? normTipo(req.body.tipo) : undefined; // undefined => não alterar
-    const horasReq = (req.body?.horas !== undefined) ? numOrNull(req.body.horas) : undefined;
-    const obs = (req.body?.obs !== undefined) ? normStr(req.body.obs) : undefined;
+    // valida e sanitiza campos (mas todos opcionais no update)
+    const hasBody = req.body && typeof req.body === "object";
+    if (!hasBody) return res.json({ ok: true, changed: 0 });
 
-    let empresaIdAlvo = null;
-    let funcionarioIdAlvo = null;
-
-    if (novoFuncionarioId) {
-      await ensureCanAccessFuncionario(req.userId, novoFuncionarioId);
-      const [[frow]] = await pool.query(`SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`, [novoFuncionarioId]);
-      if (!frow) return res.status(404).json({ ok: false, error: "Funcionário não encontrado." });
-      empresaIdAlvo = frow.empresa_id;
-      funcionarioIdAlvo = novoFuncionarioId;
-    }
-
-    // valida (usa estado atual para compor o conjunto final válido)
-    if (tipoReq !== undefined || horasReq !== undefined) {
-      const [[curr]] = await pool.query(`SELECT tipo, horas FROM ocorrencias WHERE id = ?`, [id]);
-      if (!curr) return res.status(404).json({ ok: false, error: "Ocorrência não encontrada." });
-
-      const tipoFinal = (tipoReq !== undefined) ? tipoReq : (curr.tipo ? String(curr.tipo).toUpperCase() : null);
-      const horasFinal = (horasReq !== undefined) ? horasReq : curr.horas;
-
-      await validateOcorrenciaPayload({ tipo: tipoFinal, horas: horasFinal });
-    }
-
-    // monta update dinâmico
     const sets = [];
     const params = [];
-    if (empresaIdAlvo != null) { sets.push(`empresa_id = ?`); params.push(empresaIdAlvo); }
-    if (funcionarioIdAlvo != null) { sets.push(`funcionario_id = ?`); params.push(funcionarioIdAlvo); }
-    if (data != null) { sets.push(`data = ?`); params.push(data); }
-    if (tipoReq !== undefined) { sets.push(`tipo = ?`); params.push(tipoReq); }
-    if (horasReq !== undefined) { sets.push(`horas = ?`); params.push(horasReq); }
-    if (obs !== undefined) { sets.push(`obs = ?`); params.push(obs); }
+
+    // troca de funcionário (revalida escopo e atualiza empresa)
+    if (req.body.funcionario_id != null) {
+      const novoFuncionarioId = Number(req.body.funcionario_id);
+      if (!novoFuncionarioId) throw new Error("Funcionário inválido.");
+      await ensureCanAccessFuncionario(req.userId, novoFuncionarioId);
+      const [[frow]] = await pool.query(
+        `SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`,
+        [novoFuncionarioId]
+      );
+      if (!frow) return res.status(404).json({ ok: false, error: "Funcionário não encontrado." });
+      sets.push(`empresa_id = ?`);
+      params.push(frow.empresa_id);
+      sets.push(`funcionario_id = ?`);
+      params.push(novoFuncionarioId);
+    }
+
+    if (req.body.data !== undefined) {
+      const dataISO = toDateOrNull(req.body.data);
+      if (!dataISO) throw new Error("Data inválida.");
+      sets.push(`data = ?`); params.push(dataISO);
+    }
+
+    if (req.body.tipo !== undefined) {
+      const t = cleanTipo(req.body.tipo);
+      if (!t && req.body.tipo != null) {
+        throw new Error(`Tipo inválido. Use um dos valores permitidos: ${TIPOS_MSG}.`);
+      }
+      sets.push(`tipo = ?`); params.push(t ?? null);
+    }
+
+    if (req.body.horas !== undefined) {
+      const h = numOrNull(req.body.horas);
+      sets.push(`horas = ?`); params.push(h);
+    }
+
+    if (req.body.obs !== undefined) {
+      const o = normStr(req.body.obs);
+      sets.push(`obs = ?`); params.push(o);
+    }
 
     if (!sets.length) return res.json({ ok: true, changed: 0 });
 
@@ -406,26 +352,13 @@ router.delete("/:id", async (req, res) => {
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
     await ensureCanAccessOcorrencia(req.userId, id);
+
     await pool.query(`DELETE FROM ocorrencias WHERE id = ?`, [id]);
 
     return res.json({ ok: true });
   } catch (e) {
     console.error("OCORRENCIAS_DELETE_ERR", e);
     return res.status(400).json({ ok: false, error: e.message || "Falha ao excluir ocorrência." });
-  }
-});
-
-/**
- * (Opcional) GET /api/ocorrencias/tipos
- * expõe a whitelist de tipos (lida do CHECK) para montar selects no front
- */
-router.get("/tipos", async (req, res) => {
-  try {
-    const chk = await loadOcorrenciasCheckInfo();
-    const tipos = chk.tipos ? Array.from(chk.tipos).sort() : [];
-    res.json({ ok: true, tipos, minHoras0: !!chk.hasMinHoras0, maxHoras: chk.maxHoras });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message || "Falha ao obter tipos." });
   }
 });
 
