@@ -82,7 +82,7 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
                       WHEN UPPER(a.evento)='SAIDA'   THEN a.saida
                  END) AS t_ref,
         UPPER(TRIM(a.origem)) AS origem
-      FROM apontamentos a
+      FROM sportsamericos a  -- CORRIGIDO AQUI
       JOIN funcionarios f ON f.id = a.funcionario_id
      WHERE f.empresa_id IN (?)
        ${apenasAtivos ? "AND f.ativo = 1" : ""}
