@@ -121,11 +121,20 @@ async function loadOcorrenciasCheckInfo() {
   const now = Date.now();
   if (_ocChkCache.loadedAt && now - _ocChkCache.loadedAt < 5 * 60 * 1000) return _ocChkCache;
 
+  // Em MySQL/MariaDB, TABLE_NAME não está em CHECK_CONSTRAINTS.
+  // Precisamos JOIN com TABLE_CONSTRAINTS e filtrar pelo schema atual (DATABASE()).
   const [rows] = await pool.query(
-    `SELECT CHECK_CLAUSE 
-       FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
-      WHERE TABLE_NAME = 'ocorrencias'
-      ORDER BY CONSTRAINT_NAME ASC`
+    `
+    SELECT cc.CHECK_CLAUSE
+      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS cc
+        ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+       AND cc.CONSTRAINT_NAME  = tc.CONSTRAINT_NAME
+     WHERE tc.TABLE_SCHEMA = DATABASE()
+       AND tc.TABLE_NAME   = 'ocorrencias'
+       AND tc.CONSTRAINT_TYPE = 'CHECK'
+     ORDER BY tc.CONSTRAINT_NAME ASC
+    `
   );
 
   const tipos = new Set();
@@ -135,21 +144,21 @@ async function loadOcorrenciasCheckInfo() {
   for (const r of rows) {
     const clause = String(r.CHECK_CLAUSE || "");
 
-    // extrai lista de tipos (variações comuns de sintaxe)
+    // Extrai lista de tipos do IN(...)
     const mIn = clause.match(/`?tipo`?\s*in\s*\(([^)]+)\)/i);
     if (mIn) {
       const inner = mIn[1];
       const reStr = /'([^']+)'/g;
       let mm;
       while ((mm = reStr.exec(inner))) {
-        tipos.add(mm[1]); // mantém como no CHECK (provável MAIÚSCULO)
+        tipos.add(mm[1]); // mantém como definido no CHECK (geralmente MAIÚSCULO)
       }
     }
 
     // horas >= 0
     if (/`?horas`?\s*>=\s*0/i.test(clause)) hasMinHoras0 = true;
 
-    // horas <= X (se houver)
+    // horas <= X (se existir)
     const mMax = clause.match(/`?horas`?\s*<=\s*(\d+(?:\.\d+)?)/i);
     if (mMax) {
       const v = Number(mMax[1]);
@@ -163,6 +172,7 @@ async function loadOcorrenciasCheckInfo() {
     maxHoras,
     loadedAt: now,
   };
+
   return _ocChkCache;
 }
 
