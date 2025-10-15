@@ -71,55 +71,76 @@ async function fetchApontamentosConsolidados(empresaIds, from, to, apenasAtivos)
   if (!empresaIds.length) return [];
   const [rows] = await pool.query(
     `
-    WITH base AS (
-      SELECT
+    WITH apontamentos_validos AS (
+      SELECT 
         a.funcionario_id,
         a.turno_ordem,
         DATE(a.data) AS data,
-        UPPER(a.evento) AS evento,
-        COALESCE(a.horario,
-                 CASE WHEN UPPER(a.evento)='ENTRADA' THEN a.entrada
-                      WHEN UPPER(a.evento)='SAIDA'   THEN a.saida
-                 END) AS t_ref,
-        UPPER(TRIM(a.origem)) AS origem
-      FROM sportsamericos a
+        a.evento,
+        COALESCE(a.horario, 
+                 CASE WHEN a.evento = 'ENTRADA' THEN a.entrada 
+                      WHEN a.evento = 'SAIDA' THEN a.saida 
+                 END) AS horario_real,
+        a.origem
+      FROM apontamentos a
       JOIN funcionarios f ON f.id = a.funcionario_id
-     WHERE f.empresa_id IN (?)
-       ${apenasAtivos ? "AND f.ativo = 1" : ""}
-       AND a.data BETWEEN ? AND ?
-       AND COALESCE(a.status_tratamento,'VALIDA') = 'VALIDA'
+      WHERE f.empresa_id IN (?)
+        ${apenasAtivos ? "AND f.ativo = 1" : ""}
+        AND a.data BETWEEN ? AND ?
+        AND COALESCE(a.status_tratamento, 'VALIDA') = 'VALIDA'
     ),
-    ent AS (
-      SELECT data, funcionario_id, turno_ordem,
-             TIME_FORMAT(MIN(t_ref), '%H:%i') AS entrada
-        FROM base
-       WHERE evento='ENTRADA' AND t_ref IS NOT NULL
-       GROUP BY data, funcionario_id, turno_ordem
+    entradas AS (
+      SELECT 
+        data,
+        funcionario_id,
+        turno_ordem,
+        TIME_FORMAT(MIN(horario_real), '%H:%i') AS entrada
+      FROM apontamentos_validos
+      WHERE evento = 'ENTRADA' AND horario_real IS NOT NULL
+      GROUP BY data, funcionario_id, turno_ordem
     ),
-    sai AS (
-      SELECT data, funcionario_id, turno_ordem,
-             TIME_FORMAT(MAX(t_ref), '%H:%i') AS saida
-        FROM base
-       WHERE evento='SAIDA' AND t_ref IS NOT NULL
-       GROUP BY data, funcionario_id, turno_ordem
+    saidas AS (
+      SELECT 
+        data,
+        funcionario_id,
+        turno_ordem,
+        TIME_FORMAT(MAX(horario_real), '%H:%i') AS saida
+      FROM apontamentos_validos
+      WHERE evento = 'SAIDA' AND horario_real IS NOT NULL
+      GROUP BY data, funcionario_id, turno_ordem
     )
-    SELECT
-      COALESCE(e.data, s.data) AS data,
-      COALESCE(e.funcionario_id, s.funcionario_id) AS funcionario_id,
-      COALESCE(e.turno_ordem, s.turno_ordem) AS turno_ordem,
+    SELECT 
+      e.data,
+      e.funcionario_id,
+      e.turno_ordem,
       e.entrada,
       s.saida,
+      CASE 
+        WHEN e.entrada IS NOT NULL AND s.saida IS NULL THEN 'PRESENTE'
+        ELSE 'APONTADO'
+      END AS status_presenca,
       'APONTADO' AS origem
-    FROM ent e
-    LEFT JOIN sai s
-      ON s.data=e.data AND s.funcionario_id=e.funcionario_id AND s.turno_ordem=e.turno_ordem
+    FROM entradas e
+    LEFT JOIN saidas s ON s.data = e.data 
+                      AND s.funcionario_id = e.funcionario_id 
+                      AND s.turno_ordem = e.turno_ordem
+    
     UNION ALL
-    SELECT
-      s.data, s.funcionario_id, s.turno_ordem, e.entrada, s.saida, 'APONTADO'
-      FROM sai s
-      LEFT JOIN ent e
-        ON e.data=s.data AND e.funcionario_id=s.funcionario_id AND e.turno_ordem=s.turno_ordem
-      WHERE e.funcionario_id IS NULL
+    
+    SELECT 
+      s.data,
+      s.funcionario_id,
+      s.turno_ordem,
+      e.entrada,
+      s.saida,
+      'AUSENTE' AS status_presenca,
+      'APONTADO' AS origem
+    FROM saidas s
+    LEFT JOIN entradas e ON e.data = s.data 
+                        AND e.funcionario_id = s.funcionario_id 
+                        AND e.turno_ordem = s.turno_ordem
+    WHERE e.funcionario_id IS NULL
+    
     ORDER BY data ASC, funcionario_id ASC, turno_ordem ASC
     `,
     [empresaIds, from, to]
