@@ -22,6 +22,7 @@ const numOrNull = (v) => {
 };
 
 async function getUserRoles(userId) {
+  // Nota: usuarios_perfis é por empresa; aqui coletamos nomes de perfis de qualquer empresa do usuário.
   const [rows] = await pool.query(
     `SELECT p.nome AS perfil
        FROM usuarios_perfis up
@@ -42,17 +43,6 @@ async function getUserEmpresaIds(userId) {
     [userId]
   );
   return rows.map((r) => r.empresa_id);
-}
-async function getFirstEmpresaForUser(userId) {
-  const [[row]] = await pool.query(
-    `SELECT eu.empresa_id
-       FROM empresas_usuarios eu
-      WHERE eu.usuario_id = ? AND eu.ativo = 1
-      ORDER BY eu.empresa_id ASC
-      LIMIT 1`,
-    [userId]
-  );
-  return row?.empresa_id ?? null;
 }
 
 function requireAuth(req, res, next) {
@@ -75,9 +65,8 @@ async function ensureFolhaFuncionarioScope(userId, ffId) {
   if (!empresas.length) throw new Error("Acesso negado (sem empresa vinculada).");
 
   const [[row]] = await pool.query(
-    `SELECT f.empresa_id
+    `SELECT ff.empresa_id
        FROM folhas_funcionarios ff
-       JOIN folhas f ON f.id = ff.folha_id
       WHERE ff.id = ?
       LIMIT 1`,
     [ffId]
@@ -128,7 +117,7 @@ router.get("/folhas-funcionarios", async (req, res) => {
     if (q) {
       where.push(`(
         CAST(ff.id AS CHAR) LIKE CONCAT('%',?,'%')
-        OR UPPER(COALESCE(fu.pessoa_nome, p.nome, CONCAT('#', fu.id))) LIKE UPPER(CONCAT('%',?,'%'))
+        OR UPPER(COALESCE(p.nome, CONCAT('#', fu.id))) LIKE UPPER(CONCAT('%',?,'%'))
         OR f.competencia LIKE CONCAT('%',?,'%')
       )`);
       params.push(q, q, q);
@@ -140,7 +129,7 @@ router.get("/folhas-funcionarios", async (req, res) => {
           ff.folha_id,
           ff.funcionario_id,
           f.competencia,
-          COALESCE(fu.pessoa_nome, p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
+          COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
           ff.horas_normais, ff.he50_horas, ff.he100_horas,
           ff.valor_base, ff.valor_he50, ff.valor_he100,
           ff.descontos, ff.proventos, ff.total_liquido,
@@ -175,7 +164,7 @@ router.get("/folhas-funcionarios/:id", async (req, res) => {
           ff.folha_id,
           ff.funcionario_id,
           f.competencia,
-          COALESCE(fu.pessoa_nome, p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
+          COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
           ff.horas_normais, ff.he50_horas, ff.he100_horas,
           ff.valor_base, ff.valor_he50, ff.valor_he100,
           ff.descontos, ff.proventos, ff.total_liquido,
@@ -206,6 +195,7 @@ router.get("/folhas-funcionarios/:id", async (req, res) => {
  *   descontos?, proventos?, total_liquido?, inconsistencias?
  * }
  * - Se não vier folha_id, localiza uma folha pela competência dentro do escopo do usuário.
+ * - Preenche empresa_id (obrigatório) a partir da folha.
  */
 router.post("/folhas-funcionarios", async (req, res) => {
   try {
@@ -233,7 +223,7 @@ router.post("/folhas-funcionarios", async (req, res) => {
       }
 
       const [[frow]] = await pool.query(
-        `SELECT f.id FROM folhas f WHERE ${where} ORDER BY f.id DESC LIMIT 1`,
+        `SELECT f.id, f.empresa_id FROM folhas f WHERE ${where} ORDER BY f.id DESC LIMIT 1`,
         params
       );
       if (!frow) return res.status(404).json({ ok: false, error: "Folha não encontrada para a competência/escopo." });
@@ -251,7 +241,16 @@ router.post("/folhas-funcionarios", async (req, res) => {
       }
     }
 
+    // Descobre empresa da folha para preencher em folhas_funcionarios (obrigatório)
+    const [[folhaInfo]] = await pool.query(
+      `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
+      [folha_id]
+    );
+    if (!folhaInfo) return res.status(404).json({ ok: false, error: "Folha inexistente." });
+    const empresa_id = Number(folhaInfo.empresa_id);
+
     const payload = {
+      empresa_id,
       folha_id,
       funcionario_id,
       horas_normais:  numOrNull(req.body?.horas_normais),
@@ -268,10 +267,11 @@ router.post("/folhas-funcionarios", async (req, res) => {
 
     const [ins] = await pool.query(
       `INSERT INTO folhas_funcionarios
-        (folha_id, funcionario_id, horas_normais, he50_horas, he100_horas,
+        (empresa_id, folha_id, funcionario_id, horas_normais, he50_horas, he100_horas,
          valor_base, valor_he50, valor_he100, descontos, proventos, total_liquido, inconsistencias)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
+        payload.empresa_id,
         payload.folha_id, payload.funcionario_id,
         payload.horas_normais, payload.he50_horas, payload.he100_horas,
         payload.valor_base, payload.valor_he50, payload.valor_he100,
@@ -332,7 +332,6 @@ router.delete("/folhas-funcionarios/:id", async (req, res) => {
     await pool.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
     return res.json({ ok: true });
   } catch (e) {
-    // Caso exista algum FK futuro, trate aqui (1451)
     if (e?.code === "ER_ROW_IS_REFERENCED_2" || e?.errno === 1451) {
       return res.status(409).json({ ok: false, error: "Não é possível excluir: registro referenciado." });
     }
