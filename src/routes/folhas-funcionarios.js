@@ -7,14 +7,25 @@ const router = express.Router();
 
 /* ======================= helpers ======================= */
 const norm = (v) => (v ?? "").toString().trim();
-const normStr = (v) => {
-  const s = norm(v);
-  return s.length ? s : null;
-};
-const onlyYM = (s) => {
-  const m = String(s || "").match(/^(\d{4})-(\d{2})$/);
-  return m ? `${m[1]}-${m[2]}` : null;
-};
+const normStr = (v) => { const s = norm(v); return s.length ? s : null; };
+
+/** Aceita "YYYY-MM", "YYYY-MM-DD" e nomes PT-BR -> retorna "YYYY-MM" */
+function toYM(input) {
+  const s = norm(input).toLowerCase();
+  if (!s) return null;
+  const mIso = s.match(/^(\d{4})-(\d{2})(?:-\d{2})?$/);
+  if (mIso) return `${mIso[1]}-${mIso[2]}`;
+  const meses = {
+    janeiro:"01", fevereiro:"02", março:"03", marco:"03", abril:"04", maio:"05", junho:"06",
+    julho:"07", agosto:"08", setembro:"09", outubro:"10", novembro:"11", dezembro:"12"
+  };
+  const mBr = s.match(
+    /(janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro).*?(\d{4})/i
+  );
+  if (mBr) return `${mBr[2]}-${meses[mBr[1].toLowerCase()]}`;
+  return null;
+}
+
 const numOrNull = (v) => {
   if (v === "" || v == null) return null;
   const n = Number(v);
@@ -22,7 +33,7 @@ const numOrNull = (v) => {
 };
 
 async function getUserRoles(userId) {
-  // Nota: usuarios_perfis é por empresa; aqui coletamos nomes de perfis de qualquer empresa do usuário.
+  // OBS: usuarios_perfis é por empresa; aqui coletamos perfis de qualquer empresa
   const [rows] = await pool.query(
     `SELECT p.nome AS perfil
        FROM usuarios_perfis up
@@ -82,12 +93,6 @@ router.use(requireAuth);
 
 /**
  * GET /api/folhas-funcionarios?from=YYYY-MM&to=YYYY-MM&funcionario_id=&q=&scope=mine
- * Retorna:
- *  id, folha_id, funcionario_id,
- *  competencia, funcionario_nome,
- *  horas_normais, he50_horas, he100_horas,
- *  valor_base, valor_he50, valor_he100,
- *  descontos, proventos, total_liquido, inconsistencias
  */
 router.get("/folhas-funcionarios", async (req, res) => {
   try {
@@ -95,8 +100,8 @@ router.get("/folhas-funcionarios", async (req, res) => {
     const dev = isDev(roles);
     const scope = String(req.query.scope || "mine").toLowerCase();
 
-    const from = onlyYM(req.query.from);
-    const to = onlyYM(req.query.to);
+    const from = toYM(req.query.from);
+    const to   = toYM(req.query.to);
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
     const q = normStr(req.query.q);
 
@@ -188,14 +193,8 @@ router.get("/folhas-funcionarios/:id", async (req, res) => {
 
 /**
  * POST /api/folhas-funcionarios
- * body: {
- *   folha_id?, competencia: 'YYYY-MM', funcionario_id,
- *   horas_normais?, he50_horas?, he100_horas?,
- *   valor_base?, valor_he50?, valor_he100?,
- *   descontos?, proventos?, total_liquido?, inconsistencias?
- * }
- * - Se não vier folha_id, localiza uma folha pela competência dentro do escopo do usuário.
- * - Preenche empresa_id (obrigatório) a partir da folha.
+ * - Se não vier folha_id, localiza pela competência dentro do escopo do usuário.
+ * - Preenche empresa_id a partir da folha.
  */
 router.post("/folhas-funcionarios", async (req, res) => {
   try {
@@ -204,11 +203,15 @@ router.post("/folhas-funcionarios", async (req, res) => {
 
     let { folha_id, competencia, funcionario_id } = req.body || {};
     folha_id = folha_id ? Number(folha_id) : null;
-    competencia = onlyYM(competencia);
+    competencia = toYM(competencia);
     funcionario_id = Number(funcionario_id);
 
-    if (!funcionario_id) return res.status(400).json({ ok: false, error: "Informe funcionario_id." });
-    if (!competencia && !folha_id) return res.status(400).json({ ok: false, error: "Informe competencia (YYYY-MM) ou folha_id." });
+    if (!funcionario_id) {
+      return res.status(400).json({ ok: false, error: "Informe funcionario_id." });
+    }
+    if (!competencia && !folha_id) {
+      return res.status(400).json({ ok: false, error: "Informe competencia (YYYY-MM) ou folha_id." });
+    }
 
     // resolver folha_id se não veio
     if (!folha_id) {
@@ -217,7 +220,9 @@ router.post("/folhas-funcionarios", async (req, res) => {
 
       if (!dev) {
         const empresas = await getUserEmpresaIds(req.userId);
-        if (!empresas.length) return res.status(403).json({ ok: false, error: "Usuário sem empresa vinculada." });
+        if (!empresas.length) {
+          return res.status(403).json({ ok: false, error: "Usuário sem empresa vinculada." });
+        }
         where += ` AND f.empresa_id IN (${empresas.map(() => "?").join(",")})`;
         params.push(...empresas);
       }
@@ -226,10 +231,16 @@ router.post("/folhas-funcionarios", async (req, res) => {
         `SELECT f.id, f.empresa_id FROM folhas f WHERE ${where} ORDER BY f.id DESC LIMIT 1`,
         params
       );
-      if (!frow) return res.status(404).json({ ok: false, error: "Folha não encontrada para a competência/escopo." });
-      folha_id = frow.id;
+      if (!frow) {
+        // mensagem explícita para depuração de front
+        return res.status(404).json({
+          ok: false,
+          error: `Folha não encontrada para a competência ${competencia} dentro do seu escopo.`,
+        });
+      }
+      folha_id = Number(frow.id);
     } else {
-      // validar escopo da folha
+      // validar escopo da folha informada
       if (!dev) {
         const empresas = await getUserEmpresaIds(req.userId);
         if (!empresas.length) return res.status(403).json({ ok: false, error: "Usuário sem empresa vinculada." });
@@ -241,7 +252,7 @@ router.post("/folhas-funcionarios", async (req, res) => {
       }
     }
 
-    // Descobre empresa da folha para preencher em folhas_funcionarios (obrigatório)
+    // empresa da folha (obrigatório em folhas_funcionarios)
     const [[folhaInfo]] = await pool.query(
       `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
       [folha_id]
@@ -283,7 +294,11 @@ router.post("/folhas-funcionarios", async (req, res) => {
     return res.json({ ok: true, id: ins.insertId });
   } catch (e) {
     console.error("FF_CREATE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao criar lançamento." });
+    // se vier "Column 'folha_id' cannot be null" fica mais claro pro cliente
+    const msg = /cannot be null/i.test(e?.message || "")
+      ? "Falha ao criar: 'folha_id' ficou nulo após resolução. Verifique a competência enviada."
+      : (e.message || "Falha ao criar lançamento.");
+    return res.status(400).json({ ok: false, error: msg });
   }
 });
 
