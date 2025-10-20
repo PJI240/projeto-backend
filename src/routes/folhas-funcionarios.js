@@ -18,7 +18,7 @@ function toYM(input) {
   const meses = {
     janeiro: "01", fevereiro: "02", março: "03", marco: "03",
     abril: "04", maio: "05", junho: "06", julho: "07",
-    agosto: "08", setembro: "09", outubro: "10", novembro: "11", dezembro: "12"
+    agosto: "08", setembro: "09", outubro: "10", novembro: "11", dezembro: "12",
   };
   const mBr = s.match(/(janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro).*?(\d{4})/i);
   if (mBr) return `${mBr[2]}-${meses[mBr[1].toLowerCase()]}`;
@@ -100,7 +100,7 @@ router.get("/folhas-funcionarios", async (req, res) => {
     const where = [];
     const params = [];
 
-    // Escopo por empresa via ff.empresa_id
+    // Escopo por empresa (quando não estiver em ALL como dev)
     if (!dev || scope !== "all") {
       const empresas = await getUserEmpresaIds(userId);
       if (!empresas.length) return res.json({ ok: true, items: [], scope: "mine" });
@@ -113,7 +113,7 @@ router.get("/folhas-funcionarios", async (req, res) => {
       where.push(`ff.folha_id = ?`);
       params.push(folhaId);
     } else {
-      // caso contrário, usa intervalo de competência (facilita relatórios amplos)
+      // Sem folha_id: filtra por intervalo de competência
       if (from) { where.push(`f.competencia >= ?`); params.push(from); }
       if (to)   { where.push(`f.competencia <= ?`); params.push(to);   }
     }
@@ -128,25 +128,24 @@ router.get("/folhas-funcionarios", async (req, res) => {
       params.push(q, q, q);
     }
 
-    const sql = `
-      SELECT
-        ff.id, ff.folha_id, ff.funcionario_id,
-        f.competencia,
-        COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
-        ff.horas_normais, ff.he50_horas, ff.he100_horas,
-        ff.valor_base, ff.valor_he50, ff.valor_he100,
-        ff.descontos, ff.proventos, ff.total_liquido,
-        ff.inconsistencias
-      FROM folhas_funcionarios ff
-      JOIN folhas f        ON f.id = ff.folha_id
-      JOIN funcionarios fu ON fu.id = ff.funcionario_id
-      LEFT JOIN pessoas p  ON p.id = fu.pessoa_id
-      ${where.length ? "WHERE " + where.join(" AND ") : ""}
-      ORDER BY f.competencia DESC, ff.id DESC
-    `;
-    const [rows] = await pool.query(sql, params);
+    const [rows] = await pool.query(
+      `SELECT
+         ff.id, ff.folha_id, ff.funcionario_id,
+         f.competencia,
+         COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
+         ff.horas_normais, ff.he50_horas, ff.he100_horas,
+         ff.valor_base, ff.valor_he50, ff.valor_he100,
+         ff.descontos, ff.proventos, ff.total_liquido,
+         ff.inconsistencias
+       FROM folhas_funcionarios ff
+       JOIN folhas f        ON f.id = ff.folha_id
+       JOIN funcionarios fu ON fu.id = ff.funcionario_id
+       LEFT JOIN pessoas p  ON p.id = fu.pessoa_id
+       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+       ORDER BY f.competencia DESC, ff.id DESC`,
+      params
+    );
 
-    res.setHeader("x-ff-endpoint", "v2-get");
     return res.json({ ok: true, items: rows, scope: dev && scope === "all" ? "all" : "mine" });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
@@ -292,7 +291,7 @@ router.post("/folhas-funcionarios", async (req, res) => {
         payload.horas_normais, payload.he50_horas, payload.he100_horas,
         payload.valor_base, payload.valor_he50, payload.valor_he100,
         payload.descontos, payload.proventos, payload.total_liquido,
-        payload.inconsistencias
+        payload.inconsistencias,
       ]
     );
 
@@ -332,7 +331,7 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
     if (req.body?.total_liquido !== undefined)  map("total_liquido",  numOrNull(req.body.total_liquido));
     if (req.body?.inconsistencias !== undefined)map("inconsistencias",Number(req.body.inconsistencias || 0));
 
-    // Se mudou algum valor monetário e total_liquido não foi enviado, recalcula aqui
+    // Se mudou algum valor monetário e total_liquido não foi enviado, recalcula
     const monetarios = ["valor_base","valor_he50","valor_he100","descontos","proventos"];
     const tocouMonetario = monetarios.some((k) => changed.has(k));
     const mandouTotal = changed.has("total_liquido");
