@@ -1,7 +1,7 @@
 // src/routes/folhas.js
 import express from "express";
 import { pool } from "../db.js";
-import { requireAuth } from "../middlewares/auth.js"; // usa o SEU middleware (req.user.id)
+import { requireAuth } from "../middleware/auth.js"; // usa o SEU middleware (req.user.id)
 
 const router = express.Router();
 
