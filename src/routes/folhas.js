@@ -1,7 +1,7 @@
 // src/routes/folhas.js
 import express from "express";
-import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
+import { requireAuth } from "../middlewares/auth.js"; // usa o SEU middleware (req.user.id)
 
 const router = express.Router();
 
@@ -11,8 +11,9 @@ const normStr = (v) => {
   const s = norm(v);
   return s.length ? s : null;
 };
+// aceita "YYYY-MM" ou "YYYY-MM-DD" e devolve "YYYY-MM"
 const onlyYM = (s) => {
-  const m = String(s || "").match(/^(\d{4})-(\d{2})$/);
+  const m = String(s || "").match(/^(\d{4})-(\d{2})(?:-\d{2})?$/);
   return m ? `${m[1]}-${m[2]}` : null;
 };
 
@@ -26,9 +27,9 @@ async function getUserRoles(userId) {
   );
   return rows.map((r) => String(r.perfil || "").toLowerCase());
 }
-function isDev(roles = []) {
-  return roles.map((r) => String(r).toLowerCase()).includes("desenvolvedor");
-}
+const isDev = (roles = []) =>
+  roles.map((r) => String(r).toLowerCase()).includes("desenvolvedor");
+
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `SELECT eu.empresa_id
@@ -36,7 +37,7 @@ async function getUserEmpresaIds(userId) {
       WHERE eu.usuario_id = ? AND eu.ativo = 1`,
     [userId]
   );
-  return rows.map((r) => r.empresa_id);
+  return rows.map((r) => Number(r.empresa_id));
 }
 async function getFirstEmpresaForUser(userId) {
   const [[row]] = await pool.query(
@@ -47,42 +48,39 @@ async function getFirstEmpresaForUser(userId) {
       LIMIT 1`,
     [userId]
   );
-  return row?.empresa_id ?? null;
-}
-
-function requireAuth(req, res, next) {
-  try {
-    const { token } = req.cookies || {};
-    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = payload.sub;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, error: "Sessão inválida." });
-  }
+  return row ? Number(row.empresa_id) : null;
 }
 
 async function ensureFolhaScope(userId, folhaId) {
   const roles = await getUserRoles(userId);
   if (isDev(roles)) return true;
+
   const empresas = await getUserEmpresaIds(userId);
   if (!empresas.length) throw new Error("Acesso negado (sem empresa vinculada).");
-  const [[row]] = await pool.query(`SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`, [folhaId]);
+
+  const [[row]] = await pool.query(
+    `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
+    [folhaId]
+  );
   if (!row) throw new Error("Folha não encontrada.");
-  if (!empresas.includes(Number(row.empresa_id))) throw new Error("Recurso fora do escopo do usuário.");
+
+  if (!empresas.includes(Number(row.empresa_id))) {
+    throw new Error("Recurso fora do escopo do usuário.");
+  }
   return true;
 }
 
 /* ======================= rotas ======================= */
 
-router.use(requireAuth);
+router.use(requireAuth); // agora req.user.id está garantido
 
 /**
  * GET /api/folhas?scope=mine|all&from=YYYY-MM&to=YYYY-MM&q=&status=ABERTA|FECHADA
  */
 router.get("/folhas", async (req, res) => {
   try {
-    const roles = await getUserRoles(req.userId);
+    const userId = req.user.id;
+    const roles = await getUserRoles(userId);
     const dev = isDev(roles);
 
     const scope = String(req.query.scope || "mine").toLowerCase();
@@ -94,25 +92,24 @@ router.get("/folhas", async (req, res) => {
     const where = [];
     const params = [];
 
+    // escopo por empresa
     if (!dev || scope !== "all") {
-      const empresas = await getUserEmpresaIds(req.userId);
-      if (!empresas.length) return res.json({ ok: true, folhas: [], scope: "mine" });
+      const empresas = await getUserEmpresaIds(userId);
+      if (!empresas.length) {
+        return res.json({ ok: true, folhas: [], scope: "mine" });
+      }
       where.push(`f.empresa_id IN (${empresas.map(() => "?").join(",")})`);
       params.push(...empresas);
     }
 
-    if (from) {
-      where.push(`f.competencia >= ?`);
-      params.push(from);
-    }
-    if (to) {
-      where.push(`f.competencia <= ?`);
-      params.push(to);
-    }
+    if (from) { where.push(`f.competencia >= ?`); params.push(from); }
+    if (to)   { where.push(`f.competencia <= ?`); params.push(to);   }
+
     if (status && status !== "TODOS") {
       where.push(`UPPER(f.status) = ?`);
       params.push(status);
     }
+
     if (q) {
       where.push(`(
         f.competencia LIKE CONCAT('%',?,'%')
@@ -130,7 +127,11 @@ router.get("/folhas", async (req, res) => {
       params
     );
 
-    return res.json({ ok: true, folhas: rows, scope: dev && scope === "all" ? "all" : "mine" });
+    return res.json({
+      ok: true,
+      folhas: rows,
+      scope: dev && scope === "all" ? "all" : "mine",
+    });
   } catch (e) {
     console.error("FOLHAS_LIST_ERR", e);
     return res.status(400).json({ ok: false, error: e.message || "Falha ao listar folhas." });
@@ -142,8 +143,9 @@ router.get("/folhas", async (req, res) => {
  */
 router.get("/folhas/:id", async (req, res) => {
   try {
+    const userId = req.user.id;
     const id = Number(req.params.id);
-    await ensureFolhaScope(req.userId, id);
+    await ensureFolhaScope(userId, id);
 
     const [[row]] = await pool.query(
       `SELECT f.id, f.empresa_id, f.competencia, f.status
@@ -163,44 +165,49 @@ router.get("/folhas/:id", async (req, res) => {
 
 /**
  * POST /api/folhas
- * body: { competencia:'YYYY-MM', status:'ABERTA'|'FECHADA', empresa_id? }
+ * body: { competencia:'YYYY-MM', status:'ABERTA'|'FECHADA' }
+ * OBS: empresa_id NÃO é aceito do cliente (exceto dev).
  */
 router.post("/folhas", async (req, res) => {
   try {
-    const roles = await getUserRoles(req.userId);
+    const userId = req.user.id;
+    const roles = await getUserRoles(userId);
     const dev = isDev(roles);
 
     const competencia = onlyYM(req.body?.competencia);
     const status = (normStr(req.body?.status) || "ABERTA").toUpperCase();
-    let empresa_id = req.body?.empresa_id ? Number(req.body.empresa_id) : null;
 
-    if (!competencia) return res.status(400).json({ ok: false, error: "Competência inválida (YYYY-MM)." });
+    if (!competencia) {
+      return res.status(400).json({ ok: false, error: "Competência inválida (YYYY-MM)." });
+    }
     if (!["ABERTA", "FECHADA"].includes(status)) {
       return res.status(400).json({ ok: false, error: "Status inválido (ABERTA|FECHADA)." });
     }
 
-    if (!empresa_id) {
-      // se não veio empresa, usa a primeira vinculada ao usuário (não-dev)
-      if (!dev) {
-        empresa_id = await getFirstEmpresaForUser(req.userId);
-        if (!empresa_id) return res.status(403).json({ ok: false, error: "Usuário sem empresa vinculada." });
-      } else {
-        return res.status(400).json({ ok: false, error: "Informe empresa_id (desenvolvedor)." });
+    let empresa_id = null;
+
+    if (dev && req.body?.empresa_id != null) {
+      // dev pode informar explicitamente
+      empresa_id = Number(req.body.empresa_id);
+      if (!Number.isFinite(empresa_id) || empresa_id <= 0) {
+        return res.status(400).json({ ok: false, error: "empresa_id inválido." });
       }
-    } else if (!dev) {
-      // usuário comum só pode criar na(s) sua(s) empresa(s)
-      const empresas = await getUserEmpresaIds(req.userId);
-      if (!empresas.includes(Number(empresa_id))) {
-        return res.status(403).json({ ok: false, error: "Empresa fora do escopo do usuário." });
+    } else {
+      // usuário comum SEMPRE usa empresa do vínculo
+      empresa_id = await getFirstEmpresaForUser(userId);
+      if (!empresa_id) {
+        return res.status(403).json({ ok: false, error: "Usuário sem empresa vinculada." });
       }
     }
 
-    // evita duplicidade de competência por empresa
+    // evita duplicidade (empresa_id + competencia)
     const [[dupe]] = await pool.query(
       `SELECT id FROM folhas WHERE empresa_id = ? AND competencia = ? LIMIT 1`,
       [empresa_id, competencia]
     );
-    if (dupe) return res.status(409).json({ ok: false, error: "Competência já cadastrada para esta empresa." });
+    if (dupe) {
+      return res.status(409).json({ ok: false, error: "Competência já cadastrada para esta empresa." });
+    }
 
     const [ins] = await pool.query(
       `INSERT INTO folhas (empresa_id, competencia, status)
@@ -220,8 +227,9 @@ router.post("/folhas", async (req, res) => {
  */
 router.put("/folhas/:id", async (req, res) => {
   try {
+    const userId = req.user.id;
     const id = Number(req.params.id);
-    await ensureFolhaScope(req.userId, id);
+    await ensureFolhaScope(userId, id);
 
     const sets = [];
     const params = [];
@@ -232,6 +240,7 @@ router.put("/folhas/:id", async (req, res) => {
       sets.push("competencia = ?");
       params.push(v);
     }
+
     if (req.body?.status !== undefined) {
       const st = String(req.body.status || "").toUpperCase();
       if (!["ABERTA", "FECHADA"].includes(st)) {
@@ -257,13 +266,13 @@ router.put("/folhas/:id", async (req, res) => {
  */
 router.delete("/folhas/:id", async (req, res) => {
   try {
+    const userId = req.user.id;
     const id = Number(req.params.id);
-    await ensureFolhaScope(req.userId, id);
+    await ensureFolhaScope(userId, id);
 
     try {
       await pool.query(`DELETE FROM folhas WHERE id = ?`, [id]);
     } catch (err) {
-      // FK impedindo exclusão
       if (err?.code === "ER_ROW_IS_REFERENCED_2" || err?.errno === 1451) {
         return res.status(409).json({
           ok: false,
