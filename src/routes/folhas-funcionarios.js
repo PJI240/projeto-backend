@@ -1,7 +1,7 @@
 // src/routes/folhas-funcionarios.js
 import express from "express";
 import { pool } from "../db.js";
-import { requireAuth } from "../middleware/requireAuth.js"; // ajuste o path conforme o seu projeto
+import { requireAuth } from "../middleware/requireAuth.js";
 
 const router = express.Router();
 
@@ -78,16 +78,20 @@ async function ensureFolhaFuncionarioScope(userId, ffId) {
 router.use(requireAuth);
 
 /**
- * GET /api/folhas-funcionarios?from=YYYY-MM&to=YYYY-MM&funcionario_id=&q=&scope=mine
- * -> NUNCA exige folha_id
+ * GET /api/folhas-funcionarios
+ * Query:
+ *  - folha_id?    -> se vier, domina os demais filtros de período
+ *  - from?, to?   -> YYYY-MM (usados somente quando NÃO vier folha_id)
+ *  - funcionario_id?, q?, scope?
  */
 router.get("/folhas-funcionarios", async (req, res) => {
   try {
-    const userId = req.user?.id;                       // <==== AQUI
+    const userId = req.user?.id;
     const roles = await getUserRoles(userId);
     const dev = isDev(roles);
     const scope = String(req.query.scope || "mine").toLowerCase();
 
+    const folhaId = req.query.folha_id ? Number(req.query.folha_id) : null;
     const from = toYM(req.query.from);
     const to   = toYM(req.query.to);
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
@@ -104,8 +108,16 @@ router.get("/folhas-funcionarios", async (req, res) => {
       params.push(...empresas);
     }
 
-    if (from) { where.push(`f.competencia >= ?`); params.push(from); }
-    if (to)   { where.push(`f.competencia <= ?`); params.push(to);   }
+    // Se folha_id vier, filtra diretamente por ele
+    if (folhaId) {
+      where.push(`ff.folha_id = ?`);
+      params.push(folhaId);
+    } else {
+      // caso contrário, usa intervalo de competência (facilita relatórios amplos)
+      if (from) { where.push(`f.competencia >= ?`); params.push(from); }
+      if (to)   { where.push(`f.competencia <= ?`); params.push(to);   }
+    }
+
     if (funcionarioId) { where.push(`ff.funcionario_id = ?`); params.push(funcionarioId); }
     if (q) {
       where.push(`(
@@ -134,7 +146,7 @@ router.get("/folhas-funcionarios", async (req, res) => {
     `;
     const [rows] = await pool.query(sql, params);
 
-    res.setHeader("x-ff-endpoint", "v2-get"); // debug opcional
+    res.setHeader("x-ff-endpoint", "v2-get");
     return res.json({ ok: true, items: rows, scope: dev && scope === "all" ? "all" : "mine" });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
@@ -145,7 +157,7 @@ router.get("/folhas-funcionarios", async (req, res) => {
 /** GET /api/folhas-funcionarios/:id */
 router.get("/folhas-funcionarios/:id", async (req, res) => {
   try {
-    const userId = req.user?.id;                       // <==== AQUI
+    const userId = req.user?.id;
     const id = Number(req.params.id);
     await ensureFolhaFuncionarioScope(userId, id);
 
@@ -185,7 +197,7 @@ router.post("/folhas-funcionarios", async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    const userId = req.user?.id;                       // <==== AQUI
+    const userId = req.user?.id;
     const roles = await getUserRoles(userId);
     const dev = isDev(roles);
 
@@ -213,7 +225,7 @@ router.post("/folhas-funcionarios", async (req, res) => {
         folha_id = Number(frow.id);
         empresa_id = Number(frow.empresa_id);
       } else {
-        // cria folha aberta
+        // cria folha aberta (comportamento legado)
         const [ins] = await conn.query(
           `INSERT INTO folhas (empresa_id, competencia, status, criado_em)
            VALUES (?, ?, 'ABERTA', NOW())`,
@@ -223,14 +235,19 @@ router.post("/folhas-funcionarios", async (req, res) => {
         empresa_id = alvo;
       }
     } else {
-      const [[chk]] = await conn.query(`SELECT empresa_id, competencia FROM folhas WHERE id = ? LIMIT 1`, [folha_id]);
+      const [[chk]] = await conn.query(
+        `SELECT empresa_id, competencia FROM folhas WHERE id = ? LIMIT 1`,
+        [folha_id]
+      );
       if (!chk) throw new Error("Folha inexistente.");
       if (!dev) {
         const empresas = await getUserEmpresaIds(userId);
-        if (!empresas.includes(Number(chk.empresa_id))) throw new Error("Folha fora do escopo do usuário.");
+        if (!empresas.includes(Number(chk.empresa_id))) {
+          throw new Error("Folha fora do escopo do usuário.");
+        }
       }
       empresa_id = Number(chk.empresa_id);
-      competencia = chk.competencia;
+      competencia = chk.competencia; // garante consistência
     }
 
     // evita duplicidade
@@ -293,13 +310,15 @@ router.post("/folhas-funcionarios", async (req, res) => {
 /** PUT /api/folhas-funcionarios/:id */
 router.put("/folhas-funcionarios/:id", async (req, res) => {
   try {
-    const userId = req.user?.id;                       // <==== AQUI
+    const userId = req.user?.id;
     const id = Number(req.params.id);
     await ensureFolhaFuncionarioScope(userId, id);
 
     const sets = [];
     const params = [];
     const map = (k, v) => { sets.push(`${k} = ?`); params.push(v); };
+
+    const changed = new Set(Object.keys(req.body || {}));
 
     if (req.body?.funcionario_id !== undefined) map("funcionario_id", Number(req.body.funcionario_id));
     if (req.body?.horas_normais !== undefined)  map("horas_normais",  numOrNull(req.body.horas_normais));
@@ -312,6 +331,33 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
     if (req.body?.proventos !== undefined)      map("proventos",      numOrNull(req.body.proventos));
     if (req.body?.total_liquido !== undefined)  map("total_liquido",  numOrNull(req.body.total_liquido));
     if (req.body?.inconsistencias !== undefined)map("inconsistencias",Number(req.body.inconsistencias || 0));
+
+    // Se mudou algum valor monetário e total_liquido não foi enviado, recalcula aqui
+    const monetarios = ["valor_base","valor_he50","valor_he100","descontos","proventos"];
+    const tocouMonetario = monetarios.some((k) => changed.has(k));
+    const mandouTotal = changed.has("total_liquido");
+
+    if (tocouMonetario && !mandouTotal) {
+      const [[cur]] = await pool.query(
+        `SELECT valor_base, valor_he50, valor_he100, descontos, proventos
+           FROM folhas_funcionarios WHERE id = ?`,
+        [id]
+      );
+      const patch = {
+        valor_base:  numOrNull(changed.has("valor_base")  ? req.body.valor_base  : cur?.valor_base),
+        valor_he50:  numOrNull(changed.has("valor_he50")  ? req.body.valor_he50  : cur?.valor_he50),
+        valor_he100: numOrNull(changed.has("valor_he100") ? req.body.valor_he100 : cur?.valor_he100),
+        descontos:   numOrNull(changed.has("descontos")   ? req.body.descontos   : cur?.descontos),
+        proventos:   numOrNull(changed.has("proventos")   ? req.body.proventos   : cur?.proventos),
+      };
+      const novoTotal =
+        (patch.valor_base  || 0) +
+        (patch.valor_he50  || 0) +
+        (patch.valor_he100 || 0) +
+        (patch.proventos   || 0) -
+        (patch.descontos   || 0);
+      map("total_liquido", novoTotal);
+    }
 
     if (!sets.length) return res.json({ ok: true, changed: 0 });
 
@@ -327,7 +373,7 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
 /** DELETE /api/folhas-funcionarios/:id */
 router.delete("/folhas-funcionarios/:id", async (req, res) => {
   try {
-    const userId = req.user?.id;                       // <==== AQUI
+    const userId = req.user?.id;
     const id = Number(req.params.id);
     await ensureFolhaFuncionarioScope(userId, id);
 
