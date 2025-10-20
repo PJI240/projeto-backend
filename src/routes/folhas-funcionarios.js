@@ -1,7 +1,7 @@
 // src/routes/folhas-funcionarios.js
 import express from "express";
 import { pool } from "../db.js";
-import { requireAuth } from "../middlewares/requireAuth.js"; // ajuste o path conforme o seu projeto
+import { requireAuth } from "../middleware/requireAuth.js"; // ajuste o path conforme o seu projeto
 
 const router = express.Router();
 
