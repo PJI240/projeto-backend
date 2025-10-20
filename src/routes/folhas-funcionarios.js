@@ -55,7 +55,7 @@ async function getUserEmpresaIds(userId) {
   return rows.map((r) => Number(r.empresa_id));
 }
 
-/** Valida escopo do lançamento pelo ff.empresa_id */
+/** Valida escopo do lançamento pelo **f.empresa_id** da folha vinculada */
 async function ensureFolhaFuncionarioScope(userId, ffId) {
   const roles = await getUserRoles(userId);
   if (isDev(roles)) return true;
@@ -64,7 +64,10 @@ async function ensureFolhaFuncionarioScope(userId, ffId) {
   if (!empresas.length) throw new Error("Acesso negado: usuário sem empresa vinculada.");
 
   const [[row]] = await pool.query(
-    `SELECT empresa_id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
+    `SELECT f.empresa_id
+       FROM folhas_funcionarios ff
+       JOIN folhas f ON f.id = ff.folha_id
+      WHERE ff.id = ? LIMIT 1`,
     [ffId]
   );
   if (!row) throw new Error("Registro não encontrado.");
@@ -100,11 +103,11 @@ router.get("/folhas-funcionarios", async (req, res) => {
     const where = [];
     const params = [];
 
-    // Escopo por empresa (quando não estiver em ALL como dev)
+    // Escopo por empresa via **f.empresa_id** (mais confiável que ff.empresa_id)
     if (!dev || scope !== "all") {
       const empresas = await getUserEmpresaIds(userId);
       if (!empresas.length) return res.json({ ok: true, items: [], scope: "mine" });
-      where.push(`ff.empresa_id IN (${empresas.map(() => "?").join(",")})`);
+      where.push(`f.empresa_id IN (${empresas.map(() => "?").join(",")})`);
       params.push(...empresas);
     }
 
