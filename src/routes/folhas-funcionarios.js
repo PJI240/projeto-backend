@@ -127,8 +127,8 @@ router.get("/", requireAuth, async (req, res) => {
         ff.total_liquido,
         ff.inconsistencias
       FROM folhas_funcionarios ff
-      WHERE ff.empresa_id = ?
-        AND ff.folha_id   = ?
+      WHERE ff.folha_id   = ?
+       
         ${extra}
       ORDER BY ff.funcionario_id ASC, ff.id ASC
       `,
