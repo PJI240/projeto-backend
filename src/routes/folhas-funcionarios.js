@@ -1,3 +1,4 @@
+// src/routes/folhas-funcionarios.js
 import express from "express";
 import { pool } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
@@ -94,9 +95,20 @@ async function ensureFolhaFuncionarioScopeByFF(userId, ffId) {
   return true;
 }
 
+/* ======================= MIDDLEWARES ======================= */
 /** Adapter: garante req.userId mesmo que o requireAuth só preencha req.user */
 router.use(requireAuth, (req, _res, next) => {
   if (!req.userId && req.user?.id) req.userId = req.user.id;
+  next();
+});
+
+/** Força no-cache e ETag único para evitar 304 em respostas dinâmicas */
+router.use((_req, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  // ETag único por resposta (não bate com If-None-Match do cliente)
+  res.set("ETag", `${Date.now()}-${Math.random().toString(36).slice(2)}`);
   next();
 });
 
@@ -123,14 +135,30 @@ router.get("/", async (req, res) => {
     const where = [];
     const params = [];
 
+    const roles = await getUserRoles(userId);
+    const dev = isDev(roles);
+    let empresasUser = [];
+
+    if (!dev) {
+      empresasUser = await getUserEmpresaIds(userId);
+      if (!empresasUser.length) throw new Error("Usuário sem empresa vinculada.");
+    }
+
     let empresaIdForFilter = null;
 
     if (folhaId) {
-      // filtra explicitamente por folha e, indiretamente, pelo escopo da empresa dessa folha
+      // Filtra explicitamente pela folha
       where.push(`ff.folha_id = ?`);
       params.push(folhaId);
+
+      // Segurança: mesmo com folha_id, restringe ao escopo da empresa do usuário (exceto dev)
+      if (!dev) {
+        // mysql2 expande array em IN (?) corretamente
+        where.push(`f.empresa_id IN (?)`);
+        params.push(empresasUser);
+      }
     } else {
-      // quando não vem folha, determinamos a empresa (usuário comum: 1ª empresa; dev pode passar empresa_id)
+      // Quando não vem folha, determinamos a empresa (usuário comum: 1ª empresa; dev pode passar empresa_id)
       empresaIdForFilter = await resolveEmpresaContext(userId, empresaIdQuery);
       if (empresaIdForFilter != null) {
         where.push(`f.empresa_id = ?`);
@@ -177,6 +205,7 @@ router.get("/", async (req, res) => {
         where: where.join(" AND "),
         params,
         empresaFilter: empresaIdForFilter,
+        dev,
       },
     });
   } catch (e) {
@@ -221,7 +250,7 @@ router.get("/:id", async (req, res) => {
 
 /**
  * POST /api/folhas-funcionarios
- * - Se vier folha_id: usa a empresa da própria folha
+ * - Se vier folha_id: usa a empresa da própria folha (valida escopo)
  * - Se NÃO vier folha_id: resolve por competencia + empresa do usuário (ou cria folha ABERTA se não existir)
  */
 router.post("/", async (req, res) => {
@@ -250,6 +279,7 @@ router.post("/", async (req, res) => {
         [folha_id]
       );
       if (!chk) throw new Error("Folha inexistente.");
+
       // escopo
       if (!dev) {
         const empresasUser = await getUserEmpresaIds(userId);
