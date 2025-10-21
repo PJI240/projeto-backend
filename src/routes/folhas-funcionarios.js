@@ -1,331 +1,382 @@
 // src/routes/folhas-funcionarios.js
-import express from "express";
+import { Router } from "express";
+import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
-import { requireAuth } from "../middleware/requireAuth.js";
 
-const router = express.Router();
+const router = Router();
 
-/* ======================= HELPERS ======================= */
-const numOrNull = (v) => {
-  if (v === "" || v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
+/* ===================== helpers ===================== */
 
-// Empresas do usuário autenticado (apenas ativas)
-async function getUserEmpresaIds(userId) {
-  if (!userId) return [];
-  const [rows] = await pool.query(
-    `SELECT eu.empresa_id
-       FROM empresas_usuarios eu
-      WHERE eu.usuario_id = ? AND eu.ativo = 1`,
-    [userId]
-  );
-  return rows.map((r) => Number(r.empresa_id));
+function requireAuth(req, res, next) {
+  try {
+    const { token } = req.cookies || {};
+    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = payload.sub;
+    next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "Sessão inválida." });
+  }
 }
 
-/* ======================= MIDDLEWARES ======================= */
-router.use(requireAuth, (req, _res, next) => {
-  if (!req.userId && req.user?.id) req.userId = req.user.id;
-  next();
-});
+/** Empresas acessíveis ao usuário (mesmo padrão do arquivo apontamentos.js) */
+async function getUserEmpresaIds(userId) {
+  const [rows] = await pool.query(
+    `
+    SELECT DISTINCT COALESCE(f.empresa_id, up.empresa_id) AS empresa_id
+      FROM usuarios_pessoas up
+ LEFT JOIN funcionarios f
+        ON f.pessoa_id = up.pessoa_id
+       AND (f.ativo = 1 OR f.ativo IS NULL)
+     WHERE up.usuario_id = ?
+    `,
+    [userId]
+  );
+  return rows.map((r) => r.empresa_id).filter((v) => v != null);
+}
 
-/* ======================= ROTAS ======================= */
+async function resolveEmpresaContext(userId, empresaIdQuery) {
+  const empresas = await getUserEmpresaIds(userId);
+  if (!empresas.length) throw new Error("Usuário sem vínculo a nenhuma empresa.");
 
+  if (empresaIdQuery) {
+    const id = Number(empresaIdQuery);
+    if (empresas.includes(id)) return id;
+    throw new Error("Empresa não autorizada.");
+  }
+  return empresas[0];
+}
+
+/** Normaliza decimal vindo do body (aceita "1.234,56" e "1234.56"). */
+function normDec(v) {
+  if (v == null || v === "") return 0;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const s = String(v).trim();
+  if (s.includes(",") && !s.includes(".")) {
+    return Number(s.replace(/\./g, "").replace(",", ".")) || 0;
+  }
+  const cleaned = s.replace(/[^0-9.\-]/g, "");
+  return Number(cleaned) || 0;
+}
+
+function toNullOrString(s) {
+  if (s == null) return null;
+  const t = String(s).trim();
+  return t ? t : null;
+}
+
+/** Confere se a FOLHA pertence à empresa */
+async function assertFolhaEmpresa(conn, folhaId, empresaId) {
+  const [[row]] = await conn.query(
+    `SELECT id FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
+    [Number(folhaId), Number(empresaId)]
+  );
+  if (!row) throw new Error("Folha não pertence à empresa selecionada.");
+}
+
+/** Confere se o FUNCIONÁRIO pertence à empresa */
+async function assertFuncionarioEmpresa(conn, funcionarioId, empresaId) {
+  const [[row]] = await conn.query(
+    `SELECT id FROM funcionarios WHERE id = ? AND empresa_id = ? LIMIT 1`,
+    [Number(funcionarioId), Number(empresaId)]
+  );
+  if (!row) throw new Error("Funcionário não pertence à empresa selecionada.");
+}
+
+/** Calcula total líquido se não informado explicitamente */
+function computeTotalLiquido(payload) {
+  const vb = normDec(payload.valor_base);
+  const v50 = normDec(payload.valor_he50);
+  const v100 = normDec(payload.valor_he100);
+  const prov = normDec(payload.proventos);
+  const desc = normDec(payload.descontos);
+  return vb + v50 + v100 + prov - desc;
+}
+
+/* ===================== GET /api/folhas-funcionarios ===================== */
 /**
- * GET /api/folhas-funcionarios
- * Lista lançamentos das empresas do usuário (sem exigir folha_id).
- * Filtros opcionais: folha_id, funcionario_id, q (nome/id/competência).
- * Retorna meta.folhas (distintas) para o front popular filtros sem nova chamada.
+ * Parâmetros:
+ *  - empresa_id? (opcional: resolvido por contexto se ausente)
+ *  - folha_id   (obrigatório)
+ *  - funcionario_id? (opcional)
+ *  - q? (opcional, busca por inconsistencias; se quiser nome, ver LEFT JOIN funcionários)
  */
-router.get("/", async (req, res) => {
+router.get("/", requireAuth, async (req, res) => {
   try {
-    const userId = req.userId;
-    const { folha_id, funcionario_id, q } = req.query || {};
-    console.log("🔍 FF_LIST - user:", userId, "| filtros =>", { folha_id, funcionario_id, q });
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const folhaId = Number(req.query.folha_id);
+    const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
+    const q = String(req.query.q || "").trim();
 
-    const empresasUser = await getUserEmpresaIds(userId);
-    console.log("🔍 FF_LIST - empresas:", empresasUser);
-
-    if (!empresasUser.length) {
-      return res.json({ ok: true, items: [], total: 0, meta: { folhas: [] } });
+    if (!folhaId) {
+      return res.status(400).json({ ok: false, error: "Parâmetro 'folha_id' é obrigatório." });
     }
 
-    // -------- WHERE dinâmico para itens --------
-    const where = [`ff.empresa_id IN (?)`];
-    const params = [empresasUser];
+    const params = [empresaId, folhaId];
+    let extra = "";
 
-    if (folha_id) {
-      where.push(`ff.folha_id = ?`);
-      params.push(Number(folha_id));
-    }
-    if (funcionario_id) {
-      where.push(`ff.funcionario_id = ?`);
-      params.push(Number(funcionario_id));
+    if (funcionarioId) {
+      extra += " AND ff.funcionario_id = ? ";
+      params.push(funcionarioId);
     }
     if (q) {
-      // Busca por nome (LIKE), por id exato (fu.id) e por competência (YYYY-MM)
-      where.push(`(p.nome LIKE ? OR fu.id = ? OR f.competencia LIKE ?)`);
-      params.push(`%${q}%`, Number(q) || 0, `%${q}%`);
+      extra += " AND (ff.inconsistencias LIKE ?) ";
+      params.push(`%${q}%`);
+    }
+
+    // Garantir que a folha consultada é da empresa
+    const [[chk]] = await pool.query(
+      `SELECT id FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
+      [folhaId, empresaId]
+    );
+    if (!chk) {
+      return res.status(403).json({ ok: false, error: "Folha não pertence à empresa." });
     }
 
     const [rows] = await pool.query(
-      `SELECT
-         ff.id, ff.folha_id, ff.funcionario_id, ff.empresa_id,
-         f.competencia,
-         COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
-         ff.horas_normais, ff.he50_horas, ff.he100_horas,
-         ff.valor_base, ff.valor_he50, ff.valor_he100,
-         ff.descontos, ff.proventos, ff.total_liquido,
-         ff.inconsistencias
-       FROM folhas_funcionarios ff
-       JOIN folhas        f  ON f.id  = ff.folha_id
-       JOIN funcionarios  fu ON fu.id = ff.funcionario_id
-       LEFT JOIN pessoas  p  ON p.id  = fu.pessoa_id
-       WHERE ${where.join(" AND ")}
-       ORDER BY f.competencia DESC, ff.id DESC`,
+      `
+      SELECT
+        ff.id,
+        ff.empresa_id,
+        ff.folha_id,
+        ff.funcionario_id,
+        ff.horas_normais,
+        ff.he50_horas,
+        ff.he100_horas,
+        ff.valor_base,
+        ff.valor_he50,
+        ff.valor_he100,
+        ff.descontos,
+        ff.proventos,
+        ff.total_liquido,
+        ff.inconsistencias
+      FROM folhas_funcionarios ff
+      WHERE ff.empresa_id = ?
+        AND ff.folha_id = ?
+        ${extra}
+      ORDER BY ff.funcionario_id ASC, ff.id ASC
+      `,
       params
     );
 
-    // -------- Folhas distintas (apenas das empresas do usuário) --------
-    // Usa ff para garantir que são folhas "com movimento" para esse usuário,
-    // e junta com f para trazer competencia e ordenar decentemente.
-    const [folhasDistinct] = await pool.query(
-      `SELECT DISTINCT f.id, f.competencia
-         FROM folhas_funcionarios ff
-         JOIN folhas f ON f.id = ff.folha_id
-        WHERE ff.empresa_id IN (?)
-        ORDER BY f.competencia DESC, f.id DESC`,
-      [empresasUser]
-    );
-
-    console.log("🔍 FF_LIST - encontrados:", rows.length, "| folhas disponíveis:", folhasDistinct.length);
-
-    return res.json({
-      ok: true,
-      items: rows,
-      total: rows.length,
-      meta: {
-        folhas: folhasDistinct, // [{id, competencia}]
-      },
-    });
+    return res.json({ ok: true, empresa_id: empresaId, folha_id: folhaId, folhas_funcionarios: rows });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
-    return res.status(400).json({
-      ok: false,
-      error: e.message || "Falha ao listar lançamentos.",
-    });
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao listar folhas_funcionarios." });
   }
 });
 
-/** GET /api/folhas-funcionarios/:id */
-router.get("/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const userId = req.userId;
-
-    const empresasUser = await getUserEmpresaIds(userId);
-    const [[row]] = await pool.query(
-      `SELECT
-          ff.id, ff.folha_id, ff.funcionario_id, ff.empresa_id,
-          f.competencia,
-          COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
-          ff.horas_normais, ff.he50_horas, ff.he100_horas,
-          ff.valor_base, ff.valor_he50, ff.valor_he100,
-          ff.descontos, ff.proventos, ff.total_liquido,
-          ff.inconsistencias
-        FROM folhas_funcionarios ff
-        JOIN folhas        f  ON f.id  = ff.folha_id
-        JOIN funcionarios  fu ON fu.id = ff.funcionario_id
-        LEFT JOIN pessoas  p  ON p.id  = fu.pessoa_id
-       WHERE ff.id = ? AND ff.empresa_id IN (?)
-       LIMIT 1`,
-      [id, empresasUser]
-    );
-
-    if (!row) {
-      return res.status(404).json({ ok: false, error: "Registro não encontrado." });
-    }
-    return res.json({ ok: true, item: row });
-  } catch (e) {
-    console.error("FF_GET_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao obter registro." });
-  }
-});
-
-/**
- * POST /api/folhas-funcionarios
- * Cria um lançamento (folha_id e funcionario_id obrigatórios).
- */
-router.post("/", async (req, res) => {
+/* ===================== POST /api/folhas-funcionarios ===================== */
+router.post("/", requireAuth, async (req, res) => {
   let conn;
   try {
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const {
+      folha_id,
+      funcionario_id,
+      horas_normais = 0,
+      he50_horas = 0,
+      he100_horas = 0,
+      valor_base = 0,
+      valor_he50 = 0,
+      valor_he100 = 0,
+      descontos = 0,
+      proventos = 0,
+      total_liquido = null,
+      inconsistencias = null,
+    } = req.body || {};
+
+    if (!Number(folha_id) || !Number(funcionario_id)) {
+      return res.status(400).json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
+    }
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    const userId = req.userId;
-    const { folha_id, funcionario_id } = req.body || {};
+    await assertFolhaEmpresa(conn, Number(folha_id), empresaId);
+    await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
 
-    if (!folha_id) throw new Error("Criação: 'folha_id' é obrigatório.");
-    if (!funcionario_id) throw new Error("Criação: 'funcionario_id' é obrigatório.");
-
-    // Folha precisa pertencer às empresas do usuário
-    const empresasUser = await getUserEmpresaIds(userId);
-    const [[folha]] = await conn.query(
-      `SELECT empresa_id, competencia
-         FROM folhas
-        WHERE id = ? AND empresa_id IN (?)
-        LIMIT 1`,
-      [folha_id, empresasUser]
-    );
-    if (!folha) throw new Error("Folha não encontrada ou sem acesso.");
-
-    // Funcionário precisa pertencer à mesma empresa
-    const [[funcionario]] = await conn.query(
-      `SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`,
-      [funcionario_id]
-    );
-    if (!funcionario) throw new Error("Funcionário não encontrado.");
-    if (Number(funcionario.empresa_id) !== Number(folha.empresa_id)) {
-      throw new Error("Funcionário não pertence à empresa da folha.");
-    }
-
-    // Evitar duplicidade (funcionário x folha)
-    const [[dup]] = await conn.query(
-      `SELECT id FROM folhas_funcionarios
-        WHERE folha_id = ? AND funcionario_id = ?
-        LIMIT 1`,
-      [folha_id, funcionario_id]
-    );
-    if (dup) throw new Error("Já existe um lançamento para este funcionário nesta folha.");
-
-    // Monta payload
     const payload = {
-      empresa_id: folha.empresa_id,
-      folha_id,
-      funcionario_id,
-      horas_normais:  numOrNull(req.body?.horas_normais),
-      he50_horas:     numOrNull(req.body?.he50_horas),
-      he100_horas:    numOrNull(req.body?.he100_horas),
-      valor_base:     numOrNull(req.body?.valor_base),
-      valor_he50:     numOrNull(req.body?.valor_he50),
-      valor_he100:    numOrNull(req.body?.valor_he100),
-      descontos:      numOrNull(req.body?.descontos),
-      proventos:      numOrNull(req.body?.proventos),
-      total_liquido:  numOrNull(req.body?.total_liquido),
-      inconsistencias: Number(req.body?.inconsistencias || 0),
+      empresa_id: empresaId,
+      folha_id: Number(folha_id),
+      funcionario_id: Number(funcionario_id),
+      horas_normais: normDec(horas_normais),
+      he50_horas: normDec(he50_horas),
+      he100_horas: normDec(he100_horas),
+      valor_base: normDec(valor_base),
+      valor_he50: normDec(valor_he50),
+      valor_he100: normDec(valor_he100),
+      descontos: normDec(descontos),
+      proventos: normDec(proventos),
+      total_liquido:
+        total_liquido === null || total_liquido === "" ? null : normDec(total_liquido),
+      inconsistencias: toNullOrString(inconsistencias),
     };
-
-    // Calcula total quando não informado
     if (payload.total_liquido == null) {
-      payload.total_liquido =
-        (payload.valor_base || 0) +
-        (payload.valor_he50 || 0) +
-        (payload.valor_he100 || 0) +
-        (payload.proventos || 0) -
-        (payload.descontos || 0);
+      payload.total_liquido = computeTotalLiquido(payload);
     }
 
     const [ins] = await conn.query(
-      `INSERT INTO folhas_funcionarios
+      `
+      INSERT INTO folhas_funcionarios
         (empresa_id, folha_id, funcionario_id,
          horas_normais, he50_horas, he100_horas,
          valor_base, valor_he50, valor_he100,
          descontos, proventos, total_liquido, inconsistencias)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?)
+      `,
       [
         payload.empresa_id, payload.folha_id, payload.funcionario_id,
         payload.horas_normais, payload.he50_horas, payload.he100_horas,
         payload.valor_base, payload.valor_he50, payload.valor_he100,
-        payload.descontos, payload.proventos, payload.total_liquido,
-        payload.inconsistencias,
+        payload.descontos, payload.proventos, payload.total_liquido, payload.inconsistencias
       ]
     );
 
     await conn.commit();
-
-    return res.json({
-      ok: true,
-      id: ins.insertId,
-      folha_id,
-      competencia: folha.competencia,
-    });
+    return res.json({ ok: true, id: ins.insertId });
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("FF_CREATE_ERR", e);
-    return res.status(400).json({
-      ok: false,
-      error: e.message || "Falha ao criar lançamento.",
-    });
+    const msg = String(e?.message || "");
+    if (/duplicate entry/i.test(msg)) {
+      return res.status(409).json({ ok: false, error: "Conflito de duplicidade." });
+    }
+    return res.status(400).json({ ok: false, error: msg || "Falha ao criar registro." });
   } finally {
-    if (conn) conn.release?.();
+    if (conn) conn.release();
   }
 });
 
-/** PUT /api/folhas-funcionarios/:id */
-router.put("/:id", async (req, res) => {
+/* ===================== PUT /api/folhas-funcionarios/:id ===================== */
+router.put("/:id", requireAuth, async (req, res) => {
+  let conn;
   try {
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
-       const userId = req.userId;
+    if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
-    // Verifica acesso ao registro
-    const empresasUser = await getUserEmpresaIds(userId);
-    const [[exists]] = await pool.query(
-      `SELECT id FROM folhas_funcionarios WHERE id = ? AND empresa_id IN (?)`,
-      [id, empresasUser]
-    );
-    if (!exists) throw new Error("Registro não encontrado ou sem acesso.");
+    const {
+      folha_id,
+      funcionario_id,
+      horas_normais = 0,
+      he50_horas = 0,
+      he100_horas = 0,
+      valor_base = 0,
+      valor_he50 = 0,
+      valor_he100 = 0,
+      descontos = 0,
+      proventos = 0,
+      total_liquido = null,
+      inconsistencias = null,
+    } = req.body || {};
 
-    // Campos atualizáveis
-    const sets = [];
-    const params = [];
-
-    if (req.body?.horas_normais !== undefined) { sets.push("horas_normais = ?"); params.push(numOrNull(req.body.horas_normais)); }
-    if (req.body?.he50_horas !== undefined)    { sets.push("he50_horas = ?");    params.push(numOrNull(req.body.he50_horas)); }
-    if (req.body?.he100_horas !== undefined)   { sets.push("he100_horas = ?");   params.push(numOrNull(req.body.he100_horas)); }
-    if (req.body?.valor_base !== undefined)    { sets.push("valor_base = ?");    params.push(numOrNull(req.body.valor_base)); }
-    if (req.body?.valor_he50 !== undefined)    { sets.push("valor_he50 = ?");    params.push(numOrNull(req.body.valor_he50)); }
-    if (req.body?.valor_he100 !== undefined)   { sets.push("valor_he100 = ?");   params.push(numOrNull(req.body.valor_he100)); }
-    if (req.body?.descontos !== undefined)     { sets.push("descontos = ?");     params.push(numOrNull(req.body.descontos)); }
-    if (req.body?.proventos !== undefined)     { sets.push("proventos = ?");     params.push(numOrNull(req.body.proventos)); }
-    if (req.body?.total_liquido !== undefined) { sets.push("total_liquido = ?"); params.push(numOrNull(req.body.total_liquido)); }
-    if (req.body?.inconsistencias !== undefined) {
-      sets.push("inconsistencias = ?");
-      params.push(Number(req.body.inconsistencias || 0));
+    if (!Number(folha_id) || !Number(funcionario_id)) {
+      return res.status(400).json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
-    if (!sets.length) return res.json({ ok: true, changed: 0 });
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
 
-    params.push(id);
-    await pool.query(`UPDATE folhas_funcionarios SET ${sets.join(", ")} WHERE id = ?`, params);
+    // Confere empresa do registro
+    const [[row]] = await conn.query(
+      `SELECT id, empresa_id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    if (!row || row.empresa_id !== empresaId) {
+      throw new Error("Registro não encontrado para a empresa selecionada.");
+    }
+
+    await assertFolhaEmpresa(conn, Number(folha_id), empresaId);
+    await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
+
+    const payload = {
+      horas_normais: normDec(horas_normais),
+      he50_horas: normDec(he50_horas),
+      he100_horas: normDec(he100_horas),
+      valor_base: normDec(valor_base),
+      valor_he50: normDec(valor_he50),
+      valor_he100: normDec(valor_he100),
+      descontos: normDec(descontos),
+      proventos: normDec(proventos),
+      total_liquido:
+        total_liquido === null || total_liquido === "" ? null : normDec(total_liquido),
+      inconsistencias: toNullOrString(inconsistencias),
+    };
+    if (payload.total_liquido == null) {
+      payload.total_liquido = computeTotalLiquido(payload);
+    }
+
+    await conn.query(
+      `
+      UPDATE folhas_funcionarios
+         SET folha_id = ?,
+             funcionario_id = ?,
+             horas_normais = ?,
+             he50_horas = ?,
+             he100_horas = ?,
+             valor_base = ?,
+             valor_he50 = ?,
+             valor_he100 = ?,
+             descontos = ?,
+             proventos = ?,
+             total_liquido = ?,
+             inconsistencias = ?
+       WHERE id = ? AND empresa_id = ?
+      `,
+      [
+        Number(folha_id), Number(funcionario_id),
+        payload.horas_normais, payload.he50_horas, payload.he100_horas,
+        payload.valor_base, payload.valor_he50, payload.valor_he100,
+        payload.descontos, payload.proventos, payload.total_liquido, payload.inconsistencias,
+        id, empresaId
+      ]
+    );
+
+    await conn.commit();
     return res.json({ ok: true });
   } catch (e) {
+    if (conn) await conn.rollback();
     console.error("FF_UPDATE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao atualizar lançamento." });
+    const msg = String(e?.message || "");
+    if (/duplicad|duplicate entry/i.test(msg)) {
+      return res.status(409).json({ ok: false, error: "Conflito de duplicidade." });
+    }
+    return res.status(400).json({ ok: false, error: msg || "Falha ao atualizar registro." });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
-/** DELETE /api/folhas-funcionarios/:id */
-router.delete("/:id", async (req, res) => {
+/* ===================== DELETE /api/folhas-funcionarios/:id ===================== */
+router.delete("/:id", requireAuth, async (req, res) => {
+  let conn;
   try {
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
-    const userId = req.userId;
+    if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
-    const empresasUser = await getUserEmpresaIds(userId);
-    const [[exists]] = await pool.query(
-      `SELECT id FROM folhas_funcionarios WHERE id = ? AND empresa_id IN (?)`,
-      [id, empresasUser]
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const [[row]] = await conn.query(
+      `SELECT id, empresa_id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
+      [id]
     );
-    if (!exists) throw new Error("Registro não encontrado ou sem acesso.");
+    if (!row || row.empresa_id !== empresaId) {
+      throw new Error("Registro não encontrado para a empresa selecionada.");
+    }
 
-    await pool.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
+    await conn.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
+
+    await conn.commit();
     return res.json({ ok: true });
   } catch (e) {
-    if (e?.code === "ER_ROW_IS_REFERENCED_2" || e?.errno === 1451) {
-      return res.status(409).json({ ok: false, error: "Não é possível excluir: registro referenciado." });
-    }
+    if (conn) await conn.rollback();
     console.error("FF_DELETE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao excluir lançamento." });
+    return res.status(400).json({ ok: false, error: e.message || "Falha ao excluir registro." });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
