@@ -5,9 +5,9 @@ import { pool } from "../db.js";
 
 const router = Router();
 
-/* ===================== helpers ===================== */
+/* ===================== helpers enxutos ===================== */
 
-/** Empresas acessíveis ao usuário (mesmo padrão do arquivo apontamentos.js) */
+/** Empresas acessíveis ao usuário (mantido simples) */
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `
@@ -20,22 +20,23 @@ async function getUserEmpresaIds(userId) {
     `,
     [userId]
   );
-  return rows.map((r) => r.empresa_id).filter((v) => v != null);
+  return rows.map(r => r.empresa_id).filter(v => v != null);
 }
 
-async function resolveEmpresaContext(userId, empresaIdQuery) {
-  const empresas = await getUserEmpresaIds(userId);
-  if (!empresas.length) throw new Error("Usuário sem vínculo a nenhuma empresa.");
-
-  if (empresaIdQuery) {
-    const id = Number(empresaIdQuery);
-    if (empresas.includes(id)) return id;
-    throw new Error("Empresa não autorizada.");
-  }
-  return empresas[0];
+/** Resolve a empresa **pela própria folha** e valida acesso do usuário */
+async function resolveEmpresaByFolha(userId, folhaId) {
+  const [[folha]] = await pool.query(
+    `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
+    [Number(folhaId)]
+  );
+  if (!folha) throw new Error("Folha inexistente.");
+  const empresasUser = await getUserEmpresaIds(userId);
+  if (!empresasUser.length) throw new Error("Usuário sem vínculo a nenhuma empresa.");
+  if (!empresasUser.includes(folha.empresa_id)) throw new Error("Empresa da folha não autorizada.");
+  return folha.empresa_id;
 }
 
-/** Normaliza decimal vindo do body (aceita "1.234,56" e "1234.56"). */
+/** Normaliza decimal (aceita "1.234,56" e "1234.56"). */
 function normDec(v) {
   if (v == null || v === "") return 0;
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -53,22 +54,10 @@ function toNullOrString(s) {
   return t ? t : null;
 }
 
-/** Confere se a FOLHA pertence à empresa */
-async function assertFolhaEmpresa(conn, folhaId, empresaId) {
-  const [[row]] = await conn.query(
-    `SELECT id FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
-    [Number(folhaId), Number(empresaId)]
-  );
-  if (!row) throw new Error("Folha não pertence à empresa selecionada.");
-}
-
-/** Confere se o FUNCIONÁRIO pertence à empresa */
-async function assertFuncionarioEmpresa(conn, funcionarioId, empresaId) {
-  const [[row]] = await conn.query(
-    `SELECT id FROM funcionarios WHERE id = ? AND empresa_id = ? LIMIT 1`,
-    [Number(funcionarioId), Number(empresaId)]
-  );
-  if (!row) throw new Error("Funcionário não pertence à empresa selecionada.");
+function toIntOrZero(v) {
+  if (v == null || v === "") return 0;
+  const n = Number(String(v).replace(/[^\d\-]/g, ""));
+  return Number.isFinite(n) ? n : 0;
 }
 
 /** Calcula total líquido se não informado explicitamente */
@@ -84,21 +73,22 @@ function computeTotalLiquido(payload) {
 /* ===================== GET /api/folhas-funcionarios ===================== */
 /**
  * Parâmetros:
- *  - empresa_id? (opcional: resolvido por contexto se ausente)
  *  - folha_id   (obrigatório)
  *  - funcionario_id? (opcional)
- *  - q? (opcional, busca por inconsistencias)
+ *  - q? (opcional; pesquisa em 'inconsistencias')
  */
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const folhaId = Number(req.query.folha_id);
-    const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
-    const q = String(req.query.q || "").trim();
-
     if (!folhaId) {
       return res.status(400).json({ ok: false, error: "Parâmetro 'folha_id' é obrigatório." });
     }
+
+    // empresa é definida pela folha (simples e correto)
+    const empresaId = await resolveEmpresaByFolha(req.user.id, folhaId);
+
+    const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
+    const q = String(req.query.q || "").trim();
 
     const params = [empresaId, folhaId];
     let extra = "";
@@ -108,17 +98,15 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(funcionarioId);
     }
     if (q) {
-      extra += " AND (ff.inconsistencias LIKE ?) ";
-      params.push(`%${q}%`);
-    }
-
-    // Garante que a folha consultada é da empresa
-    const [[chk]] = await pool.query(
-      `SELECT id FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
-      [folhaId, empresaId]
-    );
-    if (!chk) {
-      return res.status(403).json({ ok: false, error: "Folha não pertence à empresa." });
+      // Se q é número, compara direto; senão faz LIKE convertendo para texto
+      const qNum = Number(q);
+      if (Number.isFinite(qNum)) {
+        extra += " AND ff.inconsistencias = ? ";
+        params.push(qNum);
+      } else {
+        extra += " AND CAST(ff.inconsistencias AS CHAR) LIKE ? ";
+        params.push(`%${q}%`);
+      }
     }
 
     const [rows] = await pool.query(
@@ -140,7 +128,7 @@ router.get("/", requireAuth, async (req, res) => {
         ff.inconsistencias
       FROM folhas_funcionarios ff
       WHERE ff.empresa_id = ?
-        AND ff.folha_id = ?
+        AND ff.folha_id   = ?
         ${extra}
       ORDER BY ff.funcionario_id ASC, ff.id ASC
       `,
@@ -158,7 +146,6 @@ router.get("/", requireAuth, async (req, res) => {
 router.post("/", requireAuth, async (req, res) => {
   let conn;
   try {
-    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const {
       folha_id,
       funcionario_id,
@@ -178,11 +165,11 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
+    // empresa vem da própria folha
+    const empresaId = await resolveEmpresaByFolha(req.user.id, Number(folha_id));
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
-
-    await assertFolhaEmpresa(conn, Number(folha_id), empresaId);
-    await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
 
     const payload = {
       empresa_id: empresaId,
@@ -198,7 +185,8 @@ router.post("/", requireAuth, async (req, res) => {
       proventos: normDec(proventos),
       total_liquido:
         total_liquido === null || total_liquido === "" ? null : normDec(total_liquido),
-      inconsistencias: toNullOrString(inconsistencias),
+      inconsistencias:
+        inconsistencias === null || inconsistencias === "" ? 0 : toIntOrZero(inconsistencias),
     };
     if (payload.total_liquido == null) {
       payload.total_liquido = computeTotalLiquido(payload);
@@ -240,7 +228,6 @@ router.post("/", requireAuth, async (req, res) => {
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
-    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
@@ -263,20 +250,18 @@ router.put("/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
+    // empresa coerente com a (nova) folha
+    const empresaId = await resolveEmpresaByFolha(req.user.id, Number(folha_id));
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Confere empresa do registro
-    const [[row]] = await conn.query(
-      `SELECT id, empresa_id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
+    // Garante que o registro existe (independente da empresa anterior)
+    const [[ex]] = await conn.query(
+      `SELECT id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
       [id]
     );
-    if (!row || row.empresa_id !== empresaId) {
-      throw new Error("Registro não encontrado para a empresa selecionada.");
-    }
-
-    await assertFolhaEmpresa(conn, Number(folha_id), empresaId);
-    await assertFuncionarioEmpresa(conn, Number(funcionario_id), empresaId);
+    if (!ex) throw new Error("Registro não encontrado.");
 
     const payload = {
       horas_normais: normDec(horas_normais),
@@ -289,7 +274,8 @@ router.put("/:id", requireAuth, async (req, res) => {
       proventos: normDec(proventos),
       total_liquido:
         total_liquido === null || total_liquido === "" ? null : normDec(total_liquido),
-      inconsistencias: toNullOrString(inconsistencias),
+      inconsistencias:
+        inconsistencias === null || inconsistencias === "" ? 0 : toIntOrZero(inconsistencias),
     };
     if (payload.total_liquido == null) {
       payload.total_liquido = computeTotalLiquido(payload);
@@ -298,26 +284,27 @@ router.put("/:id", requireAuth, async (req, res) => {
     await conn.query(
       `
       UPDATE folhas_funcionarios
-         SET folha_id = ?,
+         SET empresa_id     = ?,   -- mantém coerência com a nova folha
+             folha_id       = ?,
              funcionario_id = ?,
-             horas_normais = ?,
-             he50_horas = ?,
-             he100_horas = ?,
-             valor_base = ?,
-             valor_he50 = ?,
-             valor_he100 = ?,
-             descontos = ?,
-             proventos = ?,
-             total_liquido = ?,
-             inconsistencias = ?
-       WHERE id = ? AND empresa_id = ?
+             horas_normais  = ?,
+             he50_horas     = ?,
+             he100_horas    = ?,
+             valor_base     = ?,
+             valor_he50     = ?,
+             valor_he100    = ?,
+             descontos      = ?,
+             proventos      = ?,
+             total_liquido  = ?,
+             inconsistencias= ?
+       WHERE id = ?
       `,
       [
-        Number(folha_id), Number(funcionario_id),
+        empresaId, Number(folha_id), Number(funcionario_id),
         payload.horas_normais, payload.he50_horas, payload.he100_horas,
         payload.valor_base, payload.valor_he50, payload.valor_he100,
         payload.descontos, payload.proventos, payload.total_liquido, payload.inconsistencias,
-        id, empresaId
+        id
       ]
     );
 
@@ -340,20 +327,18 @@ router.put("/:id", requireAuth, async (req, res) => {
 router.delete("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
-    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    const [[row]] = await conn.query(
-      `SELECT id, empresa_id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
+    // Apenas confirma existência antes de excluir
+    const [[ex]] = await conn.query(
+      `SELECT id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
       [id]
     );
-    if (!row || row.empresa_id !== empresaId) {
-      throw new Error("Registro não encontrado para a empresa selecionada.");
-    }
+    if (!ex) throw new Error("Registro não encontrado.");
 
     await conn.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
 
