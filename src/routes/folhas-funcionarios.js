@@ -5,14 +5,14 @@ import { requireAuth } from "../middleware/requireAuth.js";
 
 const router = express.Router();
 
-/* ======================= HELPERS SIMPLIFICADOS ======================= */
+/* ======================= HELPERS ======================= */
 const numOrNull = (v) => {
   if (v === "" || v == null) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
 
-// Obter empresas do usuário
+// Empresas do usuário autenticado
 async function getUserEmpresaIds(userId) {
   if (!userId) return [];
   const [rows] = await pool.query(
@@ -30,26 +30,46 @@ router.use(requireAuth, (req, _res, next) => {
   next();
 });
 
-/* ======================= ROTAS SIMPLIFICADAS ======================= */
+/* ======================= ROTAS ======================= */
 
 /**
  * GET /api/folhas-funcionarios
- * Lista TODOS os lançamentos das empresas do usuário
+ * Lista lançamentos das empresas do usuário.
+ * Aceita filtros opcionais: folha_id, funcionario_id, q (nome/id/competência).
  */
 router.get("/", async (req, res) => {
   try {
     const userId = req.userId;
-    console.log("🔍 FF_DEBUG - UserID:", userId);
+    const { folha_id, funcionario_id, q } = req.query || {};
+    console.log("🔍 FF_LIST - user:", userId, "| filtros =>", {
+      folha_id, funcionario_id, q,
+    });
 
-    // Obter empresas do usuário
     const empresasUser = await getUserEmpresaIds(userId);
-    console.log("🔍 FF_DEBUG - Empresas do usuário:", empresasUser);
-    
+    console.log("🔍 FF_LIST - empresas:", empresasUser);
+
     if (!empresasUser.length) {
       return res.json({ ok: true, items: [], total: 0 });
     }
 
-    // Query SIMPLES: todos os lançamentos das empresas do usuário
+    // Montagem dinâmica do WHERE
+    const where = [`ff.empresa_id IN (?)`];
+    const params = [empresasUser];
+
+    if (folha_id) {
+      where.push(`ff.folha_id = ?`);
+      params.push(Number(folha_id));
+    }
+    if (funcionario_id) {
+      where.push(`ff.funcionario_id = ?`);
+      params.push(Number(funcionario_id));
+    }
+    if (q) {
+      // Busca por nome (LIKE), por id exato (fu.id) e por competência (YYYY-MM)
+      where.push(`(p.nome LIKE ? OR fu.id = ? OR f.competencia LIKE ?)`);
+      params.push(`%${q}%`, Number(q) || 0, `%${q}%`);
+    }
+
     const [rows] = await pool.query(
       `SELECT
          ff.id, ff.folha_id, ff.funcionario_id, ff.empresa_id,
@@ -60,21 +80,16 @@ router.get("/", async (req, res) => {
          ff.descontos, ff.proventos, ff.total_liquido,
          ff.inconsistencias
        FROM folhas_funcionarios ff
-       JOIN folhas f        ON f.id = ff.folha_id
-       JOIN funcionarios fu ON fu.id = ff.funcionario_id
-       LEFT JOIN pessoas p  ON p.id = fu.pessoa_id
-       WHERE ff.empresa_id IN (?)
+       JOIN folhas        f  ON f.id  = ff.folha_id
+       JOIN funcionarios  fu ON fu.id = ff.funcionario_id
+       LEFT JOIN pessoas  p  ON p.id  = fu.pessoa_id
+       WHERE ${where.join(" AND ")}
        ORDER BY f.competencia DESC, ff.id DESC`,
-      [empresasUser]
+      params
     );
 
-    console.log("🔍 FF_DEBUG - Encontrados:", rows.length, "registros");
-
-    return res.json({
-      ok: true,
-      items: rows,
-      total: rows.length
-    });
+    console.log("🔍 FF_LIST - encontrados:", rows.length);
+    return res.json({ ok: true, items: rows, total: rows.length });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
     return res.status(400).json({
@@ -89,8 +104,7 @@ router.get("/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     const userId = req.userId;
-    
-    // Verificar se o registro pertence às empresas do usuário
+
     const empresasUser = await getUserEmpresaIds(userId);
     const [[row]] = await pool.query(
       `SELECT
@@ -102,15 +116,17 @@ router.get("/:id", async (req, res) => {
           ff.descontos, ff.proventos, ff.total_liquido,
           ff.inconsistencias
         FROM folhas_funcionarios ff
-        JOIN folhas f        ON f.id = ff.folha_id
-        JOIN funcionarios fu ON fu.id = ff.funcionario_id
-        LEFT JOIN pessoas p  ON p.id = fu.pessoa_id
+        JOIN folhas        f  ON f.id  = ff.folha_id
+        JOIN funcionarios  fu ON fu.id = ff.funcionario_id
+        LEFT JOIN pessoas  p  ON p.id  = fu.pessoa_id
        WHERE ff.id = ? AND ff.empresa_id IN (?)
        LIMIT 1`,
       [id, empresasUser]
     );
 
-    if (!row) return res.status(404).json({ ok: false, error: "Registro não encontrado." });
+    if (!row) {
+      return res.status(404).json({ ok: false, error: "Registro não encontrado." });
+    }
     return res.json({ ok: true, item: row });
   } catch (e) {
     console.error("FF_GET_ERR", e);
@@ -120,7 +136,7 @@ router.get("/:id", async (req, res) => {
 
 /**
  * POST /api/folhas-funcionarios
- * Cria um lançamento - versão simplificada
+ * Cria um lançamento.
  */
 router.post("/", async (req, res) => {
   let conn;
@@ -131,19 +147,21 @@ router.post("/", async (req, res) => {
     const userId = req.userId;
     const { folha_id, funcionario_id } = req.body || {};
 
-    if (!folha_id) throw new Error("Informe folha_id.");
-    if (!funcionario_id) throw new Error("Informe funcionario_id.");
+    if (!folha_id) throw new Error("Criação: 'folha_id' é obrigatório.");
+    if (!funcionario_id) throw new Error("Criação: 'funcionario_id' é obrigatório.");
 
-    // Verificar se a folha pertence às empresas do usuário
+    // Folha precisa pertencer às empresas do usuário
     const empresasUser = await getUserEmpresaIds(userId);
     const [[folha]] = await conn.query(
-      `SELECT empresa_id, competencia FROM folhas 
-       WHERE id = ? AND empresa_id IN (?) LIMIT 1`,
+      `SELECT empresa_id, competencia
+         FROM folhas
+        WHERE id = ? AND empresa_id IN (?)
+        LIMIT 1`,
       [folha_id, empresasUser]
     );
     if (!folha) throw new Error("Folha não encontrada ou sem acesso.");
 
-    // Verificar se funcionário pertence à mesma empresa
+    // Funcionário precisa pertencer à mesma empresa
     const [[funcionario]] = await conn.query(
       `SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`,
       [funcionario_id]
@@ -153,14 +171,16 @@ router.post("/", async (req, res) => {
       throw new Error("Funcionário não pertence à empresa da folha.");
     }
 
-    // Evitar duplicidade
+    // Evitar duplicidade (funcionário x folha)
     const [[dup]] = await conn.query(
-      `SELECT id FROM folhas_funcionarios WHERE folha_id = ? AND funcionario_id = ? LIMIT 1`,
+      `SELECT id FROM folhas_funcionarios
+        WHERE folha_id = ? AND funcionario_id = ?
+        LIMIT 1`,
       [folha_id, funcionario_id]
     );
     if (dup) throw new Error("Já existe um lançamento para este funcionário nesta folha.");
 
-    // Preparar dados
+    // Monta payload
     const payload = {
       empresa_id: folha.empresa_id,
       folha_id,
@@ -177,7 +197,7 @@ router.post("/", async (req, res) => {
       inconsistencias: Number(req.body?.inconsistencias || 0),
     };
 
-    // Calcular total se não informado
+    // Calcula total quando não informado
     if (payload.total_liquido == null) {
       payload.total_liquido =
         (payload.valor_base || 0) +
@@ -187,11 +207,12 @@ router.post("/", async (req, res) => {
         (payload.descontos || 0);
     }
 
-    // Inserir
     const [ins] = await conn.query(
       `INSERT INTO folhas_funcionarios
-        (empresa_id, folha_id, funcionario_id, horas_normais, he50_horas, he100_horas,
-         valor_base, valor_he50, valor_he100, descontos, proventos, total_liquido, inconsistencias)
+        (empresa_id, folha_id, funcionario_id,
+         horas_normais, he50_horas, he100_horas,
+         valor_base, valor_he50, valor_he100,
+         descontos, proventos, total_liquido, inconsistencias)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         payload.empresa_id, payload.folha_id, payload.funcionario_id,
@@ -204,18 +225,21 @@ router.post("/", async (req, res) => {
 
     await conn.commit();
 
-    return res.json({ 
-      ok: true, 
-      id: ins.insertId, 
-      folha_id, 
-      competencia: folha.competencia 
+    return res.json({
+      ok: true,
+      id: ins.insertId,
+      folha_id,
+      competencia: folha.competencia,
     });
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("FF_CREATE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao criar lançamento." });
+    return res.status(400).json({
+      ok: false,
+      error: e.message || "Falha ao criar lançamento.",
+    });
   } finally {
-    if (conn) conn?.release();
+    if (conn) conn.release?.();
   }
 });
 
@@ -225,7 +249,7 @@ router.put("/:id", async (req, res) => {
     const id = Number(req.params.id);
     const userId = req.userId;
 
-    // Verificar acesso
+    // Verifica acesso ao registro
     const empresasUser = await getUserEmpresaIds(userId);
     const [[exists]] = await pool.query(
       `SELECT id FROM folhas_funcionarios WHERE id = ? AND empresa_id IN (?)`,
@@ -233,48 +257,21 @@ router.put("/:id", async (req, res) => {
     );
     if (!exists) throw new Error("Registro não encontrado ou sem acesso.");
 
-    // Atualizar campos
+    // Campos atualizáveis
     const sets = [];
     const params = [];
-    
-    if (req.body?.horas_normais !== undefined) {
-      sets.push("horas_normais = ?"); 
-      params.push(numOrNull(req.body.horas_normais));
-    }
-    if (req.body?.he50_horas !== undefined) {
-      sets.push("he50_horas = ?"); 
-      params.push(numOrNull(req.body.he50_horas));
-    }
-    if (req.body?.he100_horas !== undefined) {
-      sets.push("he100_horas = ?"); 
-      params.push(numOrNull(req.body.he100_horas));
-    }
-    if (req.body?.valor_base !== undefined) {
-      sets.push("valor_base = ?"); 
-      params.push(numOrNull(req.body.valor_base));
-    }
-    if (req.body?.valor_he50 !== undefined) {
-      sets.push("valor_he50 = ?"); 
-      params.push(numOrNull(req.body.valor_he50));
-    }
-    if (req.body?.valor_he100 !== undefined) {
-      sets.push("valor_he100 = ?"); 
-      params.push(numOrNull(req.body.valor_he100));
-    }
-    if (req.body?.descontos !== undefined) {
-      sets.push("descontos = ?"); 
-      params.push(numOrNull(req.body.descontos));
-    }
-    if (req.body?.proventos !== undefined) {
-      sets.push("proventos = ?"); 
-      params.push(numOrNull(req.body.proventos));
-    }
-    if (req.body?.total_liquido !== undefined) {
-      sets.push("total_liquido = ?"); 
-      params.push(numOrNull(req.body.total_liquido));
-    }
+
+    if (req.body?.horas_normais !== undefined) { sets.push("horas_normais = ?"); params.push(numOrNull(req.body.horas_normais)); }
+    if (req.body?.he50_horas !== undefined)    { sets.push("he50_horas = ?");    params.push(numOrNull(req.body.he50_horas)); }
+    if (req.body?.he100_horas !== undefined)   { sets.push("he100_horas = ?");   params.push(numOrNull(req.body.he100_horas)); }
+    if (req.body?.valor_base !== undefined)    { sets.push("valor_base = ?");    params.push(numOrNull(req.body.valor_base)); }
+    if (req.body?.valor_he50 !== undefined)    { sets.push("valor_he50 = ?");    params.push(numOrNull(req.body.valor_he50)); }
+    if (req.body?.valor_he100 !== undefined)   { sets.push("valor_he100 = ?");   params.push(numOrNull(req.body.valor_he100)); }
+    if (req.body?.descontos !== undefined)     { sets.push("descontos = ?");     params.push(numOrNull(req.body.descontos)); }
+    if (req.body?.proventos !== undefined)     { sets.push("proventos = ?");     params.push(numOrNull(req.body.proventos)); }
+    if (req.body?.total_liquido !== undefined) { sets.push("total_liquido = ?"); params.push(numOrNull(req.body.total_liquido)); }
     if (req.body?.inconsistencias !== undefined) {
-      sets.push("inconsistencias = ?"); 
+      sets.push("inconsistencias = ?");
       params.push(Number(req.body.inconsistencias || 0));
     }
 
@@ -295,7 +292,6 @@ router.delete("/:id", async (req, res) => {
     const id = Number(req.params.id);
     const userId = req.userId;
 
-    // Verificar acesso
     const empresasUser = await getUserEmpresaIds(userId);
     const [[exists]] = await pool.query(
       `SELECT id FROM folhas_funcionarios WHERE id = ? AND empresa_id IN (?)`,
