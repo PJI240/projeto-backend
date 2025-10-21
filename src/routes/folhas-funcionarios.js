@@ -1,3 +1,4 @@
+// src/routes/folhas-funcionarios.js
 import express from "express";
 import { pool } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
@@ -113,48 +114,57 @@ router.get("/folhas-funcionarios", async (req, res) => {
       return res.json({ ok: true, items: [], scope: "mine" });
     }
 
-    // Se vier folha_id, derive a empresa a partir dela e valide escopo
-    let empresaIdFilter = null;
+    const where = [];
+    const params = [];
+
+    // LÓGICA CORRIGIDA: Se folha_id foi fornecido, usamos APENAS ele
     if (folhaId) {
+      // Primeiro verifica se a folha existe e tem escopo válido
       const [[frow]] = await pool.query(
         `SELECT id, empresa_id, competencia FROM folhas WHERE id = ? LIMIT 1`,
         [folhaId]
       );
-      if (!frow) return res.json({ ok: true, items: [], scope: "mine" });
-
-      const empresaDaFolha = Number(frow.empresa_id);
-      if (!dev && scope !== "all" && !empresasUser.includes(empresaDaFolha)) {
-        // Folha de empresa fora do escopo
+      
+      if (!frow) {
+        // Folha não existe - retorna vazio
         return res.json({ ok: true, items: [], scope: "mine" });
       }
-      empresaIdFilter = empresaDaFolha;
-    } else if (!dev || scope !== "all") {
-      // Sem folha_id: use o conjunto de empresas do usuário (ou todas se dev+all)
-      // Aqui preferimos filtrar por TODAS as empresas do usuário
-      // (o front atual já manda folha_id, então este branch é mais para relatórios amplos).
-      // empresaIdFilter permanece null e vamos usar IN (...empresasUser) mais abaixo.
-    }
 
-    const where = [];
-    const params = [];
+      const empresaDaFolha = Number(frow.empresa_id);
+      
+      // Verifica escopo apenas se não for dev
+      if (!dev && scope !== "all" && !empresasUser.includes(empresaDaFolha)) {
+        // Folha de empresa fora do escopo - retorna vazio
+        return res.json({ ok: true, items: [], scope: "mine" });
+      }
 
-    if (empresaIdFilter != null) {
-      where.push(`f.empresa_id = ?`);
-      params.push(empresaIdFilter);
-    } else if (!dev || scope !== "all") {
-      where.push(`f.empresa_id IN (${empresasUser.map(() => "?").join(",")})`);
-      params.push(...empresasUser);
-    }
-
-    if (folhaId) {
+      // Folha válida e com escopo - filtra APENAS por folha_id
       where.push(`ff.folha_id = ?`);
       params.push(folhaId);
+      
     } else {
-      if (from) { where.push(`f.competencia >= ?`); params.push(from); }
-      if (to)   { where.push(`f.competencia <= ?`); params.push(to);   }
+      // Sem folha_id: usa filtro por período e empresas do usuário
+      if (!dev || scope !== "all") {
+        where.push(`f.empresa_id IN (${empresasUser.map(() => "?").join(",")})`);
+        params.push(...empresasUser);
+      }
+
+      if (from) { 
+        where.push(`f.competencia >= ?`); 
+        params.push(from); 
+      }
+      if (to) { 
+        where.push(`f.competencia <= ?`); 
+        params.push(to); 
+      }
     }
 
-    if (funcionarioId) { where.push(`ff.funcionario_id = ?`); params.push(funcionarioId); }
+    // Filtros adicionais (funcionário e busca)
+    if (funcionarioId) { 
+      where.push(`ff.funcionario_id = ?`); 
+      params.push(funcionarioId); 
+    }
+    
     if (q) {
       where.push(`(
         CAST(ff.id AS CHAR) LIKE CONCAT('%',?,'%')
@@ -163,6 +173,14 @@ router.get("/folhas-funcionarios", async (req, res) => {
       )`);
       params.push(q, q, q);
     }
+
+    console.log('FF_QUERY_DEBUG:', {
+      userId,
+      folhaId,
+      empresasUser,
+      where: where.join(' AND '),
+      params
+    });
 
     const [rows] = await pool.query(
       `SELECT
@@ -182,10 +200,20 @@ router.get("/folhas-funcionarios", async (req, res) => {
       params
     );
 
-    return res.json({ ok: true, items: rows, scope: dev && scope === "all" ? "all" : "mine" });
+    console.log('FF_RESULTS:', rows.length, 'registros encontrados');
+
+    return res.json({ 
+      ok: true, 
+      items: rows, 
+      scope: dev && scope === "all" ? "all" : "mine"
+    });
+    
   } catch (e) {
     console.error("FF_LIST_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao listar lançamentos." });
+    return res.status(400).json({ 
+      ok: false, 
+      error: e.message || "Falha ao listar lançamentos." 
+    });
   }
 });
 
@@ -339,6 +367,15 @@ router.post("/folhas-funcionarios", async (req, res) => {
     );
 
     await conn.commit();
+    
+    console.log('FF_CREATE_SUCCESS:', {
+      id: ins.insertId,
+      folha_id,
+      competencia,
+      funcionario_id,
+      empresa_id
+    });
+    
     return res.json({ ok: true, id: ins.insertId, folha_id, competencia });
   } catch (e) {
     if (conn) await conn.rollback();
