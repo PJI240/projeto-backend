@@ -125,6 +125,8 @@ router.use((_req, res, next) => {
 router.get("/", async (req, res) => {
   try {
     const userId = req.userId;
+    console.log("🔍 FF_DEBUG - UserID:", userId, "Query:", req.query);
+
     const folhaId = req.query.folha_id ? Number(req.query.folha_id) : null;
     const empresaIdQuery = req.query.empresa_id != null ? Number(req.query.empresa_id) : null;
     const from = toYM(req.query.from);
@@ -141,6 +143,7 @@ router.get("/", async (req, res) => {
 
     if (!dev) {
       empresasUser = await getUserEmpresaIds(userId);
+      console.log("🔍 FF_DEBUG - Empresas do usuário:", empresasUser);
       if (!empresasUser.length) throw new Error("Usuário sem empresa vinculada.");
     }
 
@@ -153,7 +156,6 @@ router.get("/", async (req, res) => {
 
       // Segurança: mesmo com folha_id, restringe ao escopo da empresa do usuário (exceto dev)
       if (!dev) {
-        // mysql2 expande array em IN (?) corretamente
         where.push(`f.empresa_id IN (?)`);
         params.push(empresasUser);
       }
@@ -181,8 +183,8 @@ router.get("/", async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT
-         ff.id, ff.folha_id, ff.funcionario_id,
-         f.competencia, f.empresa_id,
+         ff.id, ff.folha_id, ff.funcionario_id, ff.empresa_id,
+         f.competencia,
          COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
          ff.horas_normais, ff.he50_horas, ff.he100_horas,
          ff.valor_base, ff.valor_he50, ff.valor_he100,
@@ -197,16 +199,14 @@ router.get("/", async (req, res) => {
       params
     );
 
+    console.log("🔍 FF_DEBUG - Query result:", rows.length, "registros");
+    console.log("🔍 FF_DEBUG - SQL WHERE:", where.join(" AND "));
+    console.log("🔍 FF_DEBUG - Params:", params);
+
     return res.json({
       ok: true,
       items: rows,
-      total: rows.length,
-      debug: {
-        where: where.join(" AND "),
-        params,
-        empresaFilter: empresaIdForFilter,
-        dev,
-      },
+      total: rows.length
     });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
@@ -225,8 +225,8 @@ router.get("/:id", async (req, res) => {
 
     const [[row]] = await pool.query(
       `SELECT
-          ff.id, ff.folha_id, ff.funcionario_id,
-          f.competencia, f.empresa_id,
+          ff.id, ff.folha_id, ff.funcionario_id, ff.empresa_id,
+          f.competencia,
           COALESCE(p.nome, CONCAT('#', fu.id)) AS funcionario_nome,
           ff.horas_normais, ff.he50_horas, ff.he100_horas,
           ff.valor_base, ff.valor_he50, ff.valor_he100,
@@ -312,6 +312,16 @@ router.post("/", async (req, res) => {
       }
     }
 
+    // CORREÇÃO: Verificar se funcionário pertence à mesma empresa
+    const [[funcCheck]] = await conn.query(
+      `SELECT empresa_id FROM funcionarios WHERE id = ? LIMIT 1`,
+      [funcionario_id]
+    );
+    if (!funcCheck) throw new Error("Funcionário não encontrado.");
+    if (Number(funcCheck.empresa_id) !== empresa_id) {
+      throw new Error("Funcionário não pertence à empresa da folha.");
+    }
+
     // Evita duplicidade do mesmo funcionário na mesma folha
     const [[dup]] = await conn.query(
       `SELECT id FROM folhas_funcionarios WHERE folha_id = ? AND funcionario_id = ? LIMIT 1`,
@@ -320,7 +330,7 @@ router.post("/", async (req, res) => {
     if (dup) throw new Error("Já existe um lançamento para este funcionário nesta folha.");
 
     const payload = {
-      empresa_id,
+      empresa_id, // CORREÇÃO: Mantemos o empresa_id aqui
       folha_id,
       funcionario_id,
       horas_normais:  numOrNull(req.body?.horas_normais),
@@ -344,6 +354,7 @@ router.post("/", async (req, res) => {
         (payload.descontos || 0);
     }
 
+    // CORREÇÃO: Incluir empresa_id no INSERT (agora corretamente)
     const [ins] = await conn.query(
       `INSERT INTO folhas_funcionarios
         (empresa_id, folha_id, funcionario_id, horas_normais, he50_horas, he100_horas,
