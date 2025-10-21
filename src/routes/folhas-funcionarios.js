@@ -1,6 +1,6 @@
 // src/routes/folhas-funcionarios.js
-import { Router } from "express";
-import jwt from "jsonwebtoken";
+import { pool } from "../db.js";
+import { requireAuth } from "../middleware/requireAuth.js";
 import { pool } from "../db.js";
 
 const router = Router();
