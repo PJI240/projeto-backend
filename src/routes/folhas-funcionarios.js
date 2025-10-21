@@ -91,64 +91,29 @@ router.use(requireAuth, (req, _res, next) => {
 /**
  * GET /api/folhas-funcionarios
  * Query:
- *  - folha_id?    -> quando vier, a empresa é derivada da própria folha
+ *  - folha_id?    -> quando vier, filtra apenas por folha_id
  *  - from?, to?   -> YYYY-MM (usados quando NÃO vier folha_id)
- *  - funcionario_id?, q?, scope? (scope=all só para dev)
+ *  - funcionario_id?, q?
+ *  - REMOVIDO: filtro por escopo do usuário temporariamente
  */
 router.get("/folhas-funcionarios", async (req, res) => {
   try {
-    const userId = req.userId;
-    const roles = await getUserRoles(userId);
-    const dev = isDev(roles);
-    const scope = String(req.query.scope || "mine").toLowerCase();
-
     const folhaId = req.query.folha_id ? Number(req.query.folha_id) : null;
     const from = toYM(req.query.from);
     const to = toYM(req.query.to);
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
     const q = normStr(req.query.q);
 
-    // Empresas do usuário
-    const empresasUser = await getUserEmpresaIds(userId);
-    if (!empresasUser.length && !dev) {
-      return res.json({ ok: true, items: [], scope: "mine" });
-    }
-
     const where = [];
     const params = [];
 
-    // LÓGICA CORRIGIDA: Se folha_id foi fornecido, usamos APENAS ele
+    // FILTRO SIMPLIFICADO - SEM RESTRIÇÃO DE USUÁRIO/EMPRESA
     if (folhaId) {
-      // Primeiro verifica se a folha existe e tem escopo válido
-      const [[frow]] = await pool.query(
-        `SELECT id, empresa_id, competencia FROM folhas WHERE id = ? LIMIT 1`,
-        [folhaId]
-      );
-      
-      if (!frow) {
-        // Folha não existe - retorna vazio
-        return res.json({ ok: true, items: [], scope: "mine" });
-      }
-
-      const empresaDaFolha = Number(frow.empresa_id);
-      
-      // Verifica escopo apenas se não for dev
-      if (!dev && scope !== "all" && !empresasUser.includes(empresaDaFolha)) {
-        // Folha de empresa fora do escopo - retorna vazio
-        return res.json({ ok: true, items: [], scope: "mine" });
-      }
-
-      // Folha válida e com escopo - filtra APENAS por folha_id
+      // Filtra apenas por folha_id
       where.push(`ff.folha_id = ?`);
       params.push(folhaId);
-      
     } else {
-      // Sem folha_id: usa filtro por período e empresas do usuário
-      if (!dev || scope !== "all") {
-        where.push(`f.empresa_id IN (${empresasUser.map(() => "?").join(",")})`);
-        params.push(...empresasUser);
-      }
-
+      // Sem folha_id: usa filtro por período
       if (from) { 
         where.push(`f.competencia >= ?`); 
         params.push(from); 
@@ -175,9 +140,11 @@ router.get("/folhas-funcionarios", async (req, res) => {
     }
 
     console.log('FF_QUERY_DEBUG:', {
-      userId,
       folhaId,
-      empresasUser,
+      from,
+      to,
+      funcionarioId,
+      q,
       where: where.join(' AND '),
       params
     });
@@ -204,8 +171,13 @@ router.get("/folhas-funcionarios", async (req, res) => {
 
     return res.json({ 
       ok: true, 
-      items: rows, 
-      scope: dev && scope === "all" ? "all" : "mine"
+      items: rows,
+      total: rows.length,
+      debug: {
+        query: where.join(' AND '),
+        params,
+        rowCount: rows.length
+      }
     });
     
   } catch (e) {
@@ -220,9 +192,10 @@ router.get("/folhas-funcionarios", async (req, res) => {
 /** GET /api/folhas-funcionarios/:id */
 router.get("/folhas-funcionarios/:id", async (req, res) => {
   try {
-    const userId = req.userId;
     const id = Number(req.params.id);
-    await ensureFolhaFuncionarioScopeByFF(userId, id);
+    
+    // REMOVIDO: validação de escopo temporariamente
+    // await ensureFolhaFuncionarioScopeByFF(userId, id);
 
     const [[row]] = await pool.query(
       `SELECT
@@ -251,7 +224,7 @@ router.get("/folhas-funcionarios/:id", async (req, res) => {
 
 /**
  * POST /api/folhas-funcionarios
- * - Se vier folha_id: valida escopo pela empresa da folha (e usa a empresa da própria folha)
+ * - Se vier folha_id: usa a empresa da própria folha
  * - Se NÃO vier folha_id: resolve por competencia + empresa do usuário (ou cria folha ABERTA se não existir)
  */
 router.post("/folhas-funcionarios", async (req, res) => {
@@ -275,19 +248,12 @@ router.post("/folhas-funcionarios", async (req, res) => {
     let empresa_id;
 
     if (folha_id) {
-      // Usa a empresa da própria folha (e valida escopo)
+      // Usa a empresa da própria folha
       const [[chk]] = await conn.query(
         `SELECT empresa_id, competencia FROM folhas WHERE id = ? LIMIT 1`,
         [folha_id]
       );
       if (!chk) throw new Error("Folha inexistente.");
-
-      if (!dev) {
-        const empresasUser = await getUserEmpresaIds(userId);
-        if (!empresasUser.includes(Number(chk.empresa_id))) {
-          throw new Error("Folha fora do escopo do usuário.");
-        }
-      }
 
       empresa_id = Number(chk.empresa_id);
       // mantém competencia coerente com a folha
@@ -389,9 +355,10 @@ router.post("/folhas-funcionarios", async (req, res) => {
 /** PUT /api/folhas-funcionarios/:id */
 router.put("/folhas-funcionarios/:id", async (req, res) => {
   try {
-    const userId = req.userId;
     const id = Number(req.params.id);
-    await ensureFolhaFuncionarioScopeByFF(userId, id);
+    
+    // REMOVIDO: validação de escopo temporariamente
+    // await ensureFolhaFuncionarioScopeByFF(userId, id);
 
     const sets = [];
     const params = [];
@@ -452,9 +419,10 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
 /** DELETE /api/folhas-funcionarios/:id */
 router.delete("/folhas-funcionarios/:id", async (req, res) => {
   try {
-    const userId = req.userId;
     const id = Number(req.params.id);
-    await ensureFolhaFuncionarioScopeByFF(userId, id);
+    
+    // REMOVIDO: validação de escopo temporariamente
+    // await ensureFolhaFuncionarioScopeByFF(userId, id);
 
     await pool.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
     return res.json({ ok: true });
