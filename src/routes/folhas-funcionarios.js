@@ -12,7 +12,7 @@ const numOrNull = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-// Empresas do usuário autenticado
+// Empresas do usuário autenticado (apenas ativas)
 async function getUserEmpresaIds(userId) {
   if (!userId) return [];
   const [rows] = await pool.query(
@@ -34,25 +34,24 @@ router.use(requireAuth, (req, _res, next) => {
 
 /**
  * GET /api/folhas-funcionarios
- * Lista lançamentos das empresas do usuário.
- * Aceita filtros opcionais: folha_id, funcionario_id, q (nome/id/competência).
+ * Lista lançamentos das empresas do usuário (sem exigir folha_id).
+ * Filtros opcionais: folha_id, funcionario_id, q (nome/id/competência).
+ * Retorna meta.folhas (distintas) para o front popular filtros sem nova chamada.
  */
 router.get("/", async (req, res) => {
   try {
     const userId = req.userId;
     const { folha_id, funcionario_id, q } = req.query || {};
-    console.log("🔍 FF_LIST - user:", userId, "| filtros =>", {
-      folha_id, funcionario_id, q,
-    });
+    console.log("🔍 FF_LIST - user:", userId, "| filtros =>", { folha_id, funcionario_id, q });
 
     const empresasUser = await getUserEmpresaIds(userId);
     console.log("🔍 FF_LIST - empresas:", empresasUser);
 
     if (!empresasUser.length) {
-      return res.json({ ok: true, items: [], total: 0 });
+      return res.json({ ok: true, items: [], total: 0, meta: { folhas: [] } });
     }
 
-    // Montagem dinâmica do WHERE
+    // -------- WHERE dinâmico para itens --------
     const where = [`ff.empresa_id IN (?)`];
     const params = [empresasUser];
 
@@ -88,8 +87,28 @@ router.get("/", async (req, res) => {
       params
     );
 
-    console.log("🔍 FF_LIST - encontrados:", rows.length);
-    return res.json({ ok: true, items: rows, total: rows.length });
+    // -------- Folhas distintas (apenas das empresas do usuário) --------
+    // Usa ff para garantir que são folhas "com movimento" para esse usuário,
+    // e junta com f para trazer competencia e ordenar decentemente.
+    const [folhasDistinct] = await pool.query(
+      `SELECT DISTINCT f.id, f.competencia
+         FROM folhas_funcionarios ff
+         JOIN folhas f ON f.id = ff.folha_id
+        WHERE ff.empresa_id IN (?)
+        ORDER BY f.competencia DESC, f.id DESC`,
+      [empresasUser]
+    );
+
+    console.log("🔍 FF_LIST - encontrados:", rows.length, "| folhas disponíveis:", folhasDistinct.length);
+
+    return res.json({
+      ok: true,
+      items: rows,
+      total: rows.length,
+      meta: {
+        folhas: folhasDistinct, // [{id, competencia}]
+      },
+    });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
     return res.status(400).json({
@@ -136,7 +155,7 @@ router.get("/:id", async (req, res) => {
 
 /**
  * POST /api/folhas-funcionarios
- * Cria um lançamento.
+ * Cria um lançamento (folha_id e funcionario_id obrigatórios).
  */
 router.post("/", async (req, res) => {
   let conn;
@@ -247,7 +266,7 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const userId = req.userId;
+       const userId = req.userId;
 
     // Verifica acesso ao registro
     const empresasUser = await getUserEmpresaIds(userId);
