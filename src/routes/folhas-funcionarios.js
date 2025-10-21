@@ -111,23 +111,24 @@ router.get("/", requireAuth, async (req, res) => {
 
     const [rows] = await pool.query(
       `
-      SELECT
-        ff.id,
-        ff.empresa_id,
-        ff.folha_id,
-        ff.funcionario_id,
-        ff.horas_normais,
-        ff.he50_horas,
-        ff.he100_horas,
-        ff.valor_base,
-        ff.valor_he50,
-        ff.valor_he100,
-        ff.descontos,
-        ff.proventos,
-        ff.total_liquido,
-        ff.inconsistencias
-      FROM folhas_funcionarios ff
-      WHERE ff.folha_id   = ?
+ SELECT
+    ff.id,
+    ff.empresa_id,
+    ff.folha_id,
+    ff.funcionario_id,
+    ff.horas_normais,
+    ff.he50_horas,
+    ff.he100_horas,
+    ff.valor_base,
+    ff.valor_he50,
+    ff.valor_he100,
+    ff.descontos,
+    ff.proventos,
+    ff.total_liquido,
+    ff.inconsistencias
+  FROM folhas_funcionarios ff
+  WHERE ff.empresa_id = ?
+    AND ff.folha_id   = ?
        
         ${extra}
       ORDER BY ff.funcionario_id ASC, ff.id ASC
