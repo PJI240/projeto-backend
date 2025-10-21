@@ -1,5 +1,4 @@
 // src/routes/folhas-funcionarios.js
-import { pool } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { pool } from "../db.js";
 
