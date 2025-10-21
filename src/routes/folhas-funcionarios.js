@@ -1,9 +1,9 @@
 // src/routes/folhas-funcionarios.js
-import express from "express";
+import { Router } from "express";
+import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
-import { requireAuth } from "../middleware/requireAuth.js";
 
-const router = express.Router();
+const router = Router();
 
 /* ======================= HELPERS ======================= */
 const norm = (v) => (v ?? "").toString().trim();
@@ -16,36 +16,21 @@ function toYM(input) {
   const mIso = s.match(/^(\d{4})-(\d{2})(?:-\d{2})?$/);
   if (mIso) return `${mIso[1]}-${mIso[2]}`;
   const meses = {
-    janeiro: "01", fevereiro: "02", março: "03", marco: "03",
-    abril: "04", maio: "05", junho: "06", julho: "07",
-    agosto: "08", setembro: "09", outubro: "10", novembro: "11", dezembro: "12",
+    janeiro:"01", fevereiro:"02", março:"03", marco:"03", abril:"04", maio:"05",
+    junho:"06", julho:"07", agosto:"08", setembro:"09", outubro:"10", novembro:"11", dezembro:"12",
   };
   const mBr = s.match(/(janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro).*?(\d{4})/i);
   if (mBr) return `${mBr[2]}-${meses[mBr[1].toLowerCase()]}`;
   return null;
 }
-
 const numOrNull = (v) => {
   if (v === "" || v == null) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
 
-async function getUserRoles(userId) {
-  if (!userId) return [];
-  const [rows] = await pool.query(
-    `SELECT p.nome AS perfil
-       FROM usuarios_perfis up
-       JOIN perfis p ON p.id = up.perfil_id
-      WHERE up.usuario_id = ?`,
-    [userId]
-  );
-  return rows.map((r) => String(r.perfil || "").toLowerCase());
-}
-const isDev = (roles = []) => roles.includes("desenvolvedor");
-
+/* ===== helpers compatíveis com cargos.js ===== */
 async function getUserEmpresaIds(userId) {
-  if (!userId) return [];
   const [rows] = await pool.query(
     `SELECT eu.empresa_id
        FROM empresas_usuarios eu
@@ -55,44 +40,42 @@ async function getUserEmpresaIds(userId) {
   return rows.map((r) => Number(r.empresa_id));
 }
 
-/** Valida escopo do lançamento pelo **f.empresa_id** da folha vinculada */
-async function ensureFolhaFuncionarioScope(userId, ffId) {
-  const roles = await getUserRoles(userId);
-  if (isDev(roles)) return true;
-
+async function resolveEmpresaContext(userId, empresaIdQuery) {
   const empresas = await getUserEmpresaIds(userId);
-  if (!empresas.length) throw new Error("Acesso negado: usuário sem empresa vinculada.");
-
-  const [[row]] = await pool.query(
-    `SELECT f.empresa_id
-       FROM folhas_funcionarios ff
-       JOIN folhas f ON f.id = ff.folha_id
-      WHERE ff.id = ? LIMIT 1`,
-    [ffId]
-  );
-  if (!row) throw new Error("Registro não encontrado.");
-  if (!empresas.includes(Number(row.empresa_id))) {
-    throw new Error("Recurso fora do escopo do usuário.");
+  if (!empresas.length) throw new Error("Usuário sem empresa vinculada.");
+  if (empresaIdQuery != null) {
+    const id = Number(empresaIdQuery);
+    if (empresas.includes(id)) return id;
+    throw new Error("Empresa não autorizada.");
   }
-  return true;
+  return empresas[0];
+}
+
+function requireAuth(req, res, next) {
+  try {
+    const { token } = req.cookies || {};
+    if (!token) return res.status(401).json({ ok:false, error:"Não autenticado." });
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = payload.sub;
+    next();
+  } catch {
+    return res.status(401).json({ ok:false, error:"Sessão inválida." });
+  }
 }
 
 /* ======================= ROTAS ======================= */
-router.use(requireAuth);
 
 /**
  * GET /api/folhas-funcionarios
  * Query:
- *  - folha_id?    -> se vier, domina os demais filtros de período
- *  - from?, to?   -> YYYY-MM (usados somente quando NÃO vier folha_id)
- *  - funcionario_id?, q?, scope?
+ *  - empresa_id?      (opcional, valida escopo)
+ *  - folha_id?        (se vier, domina o período)
+ *  - from?, to?       (YYYY-MM, usados quando NÃO vier folha_id)
+ *  - funcionario_id?, q?
  */
-router.get("/folhas-funcionarios", async (req, res) => {
+router.get("/folhas-funcionarios", requireAuth, async (req, res) => {
   try {
-    const userId = req.user?.id;
-    const roles = await getUserRoles(userId);
-    const dev = isDev(roles);
-    const scope = String(req.query.scope || "mine").toLowerCase();
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
 
     const folhaId = req.query.folha_id ? Number(req.query.folha_id) : null;
     const from = toYM(req.query.from);
@@ -100,23 +83,19 @@ router.get("/folhas-funcionarios", async (req, res) => {
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
     const q = normStr(req.query.q);
 
-    const where = [];
-    const params = [];
+    const where = ["f.empresa_id = ?"];
+    const params = [empresaId];
 
-    // Escopo por empresa via **f.empresa_id** (mais confiável que ff.empresa_id)
-    if (!dev || scope !== "all") {
-      const empresas = await getUserEmpresaIds(userId);
-      if (!empresas.length) return res.json({ ok: true, items: [], scope: "mine" });
-      where.push(`f.empresa_id IN (${empresas.map(() => "?").join(",")})`);
-      params.push(...empresas);
-    }
-
-    // Se folha_id vier, filtra diretamente por ele
     if (folhaId) {
+      // garante que a folha pertence à empresa
+      const [[okFolha]] = await pool.query(
+        `SELECT 1 FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
+        [folhaId, empresaId]
+      );
+      if (!okFolha) return res.json({ ok:true, items: [] }); // fora do escopo
       where.push(`ff.folha_id = ?`);
       params.push(folhaId);
     } else {
-      // Sem folha_id: filtra por intervalo de competência
       if (from) { where.push(`f.competencia >= ?`); params.push(from); }
       if (to)   { where.push(`f.competencia <= ?`); params.push(to);   }
     }
@@ -144,24 +123,23 @@ router.get("/folhas-funcionarios", async (req, res) => {
        JOIN folhas f        ON f.id = ff.folha_id
        JOIN funcionarios fu ON fu.id = ff.funcionario_id
        LEFT JOIN pessoas p  ON p.id = fu.pessoa_id
-       ${where.length ? "WHERE " + where.join(" AND ") : ""}
+       WHERE ${where.join(" AND ")}
        ORDER BY f.competencia DESC, ff.id DESC`,
       params
     );
 
-    return res.json({ ok: true, items: rows, scope: dev && scope === "all" ? "all" : "mine" });
+    return res.json({ ok: true, items: rows, empresa_id: empresaId });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao listar lançamentos." });
+    return res.status(400).json({ ok:false, error: e.message || "Falha ao listar lançamentos." });
   }
 });
 
 /** GET /api/folhas-funcionarios/:id */
-router.get("/folhas-funcionarios/:id", async (req, res) => {
+router.get("/folhas-funcionarios/:id", requireAuth, async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
-    await ensureFolhaFuncionarioScope(userId, id);
 
     const [[row]] = await pool.query(
       `SELECT
@@ -176,32 +154,32 @@ router.get("/folhas-funcionarios/:id", async (req, res) => {
         JOIN folhas f        ON f.id = ff.folha_id
         JOIN funcionarios fu ON fu.id = ff.funcionario_id
         LEFT JOIN pessoas p  ON p.id = fu.pessoa_id
-       WHERE ff.id = ? LIMIT 1`,
-      [id]
+       WHERE ff.id = ? AND f.empresa_id = ?
+       LIMIT 1`,
+      [id, empresaId]
     );
 
-    if (!row) return res.status(404).json({ ok: false, error: "Registro não encontrado." });
-    return res.json({ ok: true, item: row });
+    if (!row) return res.status(404).json({ ok:false, error:"Registro não encontrado." });
+    return res.json({ ok:true, item: row, empresa_id: empresaId });
   } catch (e) {
     console.error("FF_GET_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao obter registro." });
+    return res.status(400).json({ ok:false, error: e.message || "Falha ao obter registro." });
   }
 });
 
 /**
  * POST /api/folhas-funcionarios
- * - resolve folha pela competência + empresa do usuário quando não vier folha_id
- * - preenche empresa_id a partir da folha
+ * body: { folha_id? , competencia? (YYYY-MM), funcionario_id, ...valores }
+ * - Usa a empresa do contexto (resolveEmpresaContext)
+ * - Se não vier folha_id, acha/cria folha (ABERTA) da mesma empresa e competência
  */
-router.post("/folhas-funcionarios", async (req, res) => {
+router.post("/folhas-funcionarios", requireAuth, async (req, res) => {
   let conn;
   try {
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
-
-    const userId = req.user?.id;
-    const roles = await getUserRoles(userId);
-    const dev = isDev(roles);
 
     let { folha_id, competencia, funcionario_id } = req.body || {};
     folha_id = folha_id ? Number(folha_id) : null;
@@ -211,48 +189,33 @@ router.post("/folhas-funcionarios", async (req, res) => {
     if (!funcionario_id) throw new Error("Informe funcionario_id.");
     if (!competencia && !folha_id) throw new Error("Informe competencia (YYYY-MM) ou folha_id.");
 
-    // Determina folha/empresa
-    let empresa_id;
-    if (!folha_id) {
-      const empresas = await getUserEmpresaIds(userId);
-      if (!dev && !empresas.length) throw new Error("Usuário sem empresa vinculada.");
-      const alvo = dev && req.body.empresa_id ? Number(req.body.empresa_id) : empresas[0];
-      if (!alvo) throw new Error("Não foi possível determinar a empresa.");
-
+    if (folha_id) {
+      // valida que a folha pertence à empresa do contexto
+      const [[okFolha]] = await conn.query(
+        `SELECT competencia FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
+        [folha_id, empresaId]
+      );
+      if (!okFolha) throw new Error("Folha fora do escopo da empresa.");
+      competencia = okFolha.competencia; // mantém consistente
+    } else {
+      // acha/cria folha da empresaId para a competência
       const [[frow]] = await conn.query(
-        `SELECT id, empresa_id FROM folhas WHERE competencia = ? AND empresa_id = ? LIMIT 1`,
-        [competencia, alvo]
+        `SELECT id FROM folhas WHERE empresa_id = ? AND competencia = ? LIMIT 1`,
+        [empresaId, competencia]
       );
       if (frow) {
         folha_id = Number(frow.id);
-        empresa_id = Number(frow.empresa_id);
       } else {
-        // cria folha aberta (comportamento legado)
-        const [ins] = await conn.query(
+        const [insFolha] = await conn.query(
           `INSERT INTO folhas (empresa_id, competencia, status, criado_em)
-           VALUES (?, ?, 'ABERTA', NOW())`,
-          [alvo, competencia]
+           VALUES (?,?, 'ABERTA', NOW())`,
+          [empresaId, competencia]
         );
-        folha_id = ins.insertId;
-        empresa_id = alvo;
+        folha_id = insFolha.insertId;
       }
-    } else {
-      const [[chk]] = await conn.query(
-        `SELECT empresa_id, competencia FROM folhas WHERE id = ? LIMIT 1`,
-        [folha_id]
-      );
-      if (!chk) throw new Error("Folha inexistente.");
-      if (!dev) {
-        const empresas = await getUserEmpresaIds(userId);
-        if (!empresas.includes(Number(chk.empresa_id))) {
-          throw new Error("Folha fora do escopo do usuário.");
-        }
-      }
-      empresa_id = Number(chk.empresa_id);
-      competencia = chk.competencia; // garante consistência
     }
 
-    // evita duplicidade
+    // unicidade
     const [[dup]] = await conn.query(
       `SELECT id FROM folhas_funcionarios WHERE folha_id = ? AND funcionario_id = ? LIMIT 1`,
       [folha_id, funcionario_id]
@@ -260,7 +223,7 @@ router.post("/folhas-funcionarios", async (req, res) => {
     if (dup) throw new Error("Já existe um lançamento para este funcionário nesta folha.");
 
     const payload = {
-      empresa_id,
+      empresa_id: empresaId,
       folha_id,
       funcionario_id,
       horas_normais:  numOrNull(req.body?.horas_normais),
@@ -299,22 +262,32 @@ router.post("/folhas-funcionarios", async (req, res) => {
     );
 
     await conn.commit();
-    return res.json({ ok: true, id: ins.insertId, folha_id, competencia });
+    return res.json({ ok:true, id: ins.insertId, folha_id, competencia, empresa_id: empresaId });
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("FF_CREATE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao criar lançamento." });
+    return res.status(400).json({ ok:false, error: e.message || "Falha ao criar lançamento." });
   } finally {
     if (conn) conn.release();
   }
 });
 
 /** PUT /api/folhas-funcionarios/:id */
-router.put("/folhas-funcionarios/:id", async (req, res) => {
+router.put("/folhas-funcionarios/:id", requireAuth, async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
-    await ensureFolhaFuncionarioScope(userId, id);
+
+    // garante pertencimento
+    const [[okRow]] = await pool.query(
+      `SELECT 1
+         FROM folhas_funcionarios ff
+         JOIN folhas f ON f.id = ff.folha_id
+        WHERE ff.id = ? AND f.empresa_id = ?
+        LIMIT 1`,
+      [id, empresaId]
+    );
+    if (!okRow) return res.status(404).json({ ok:false, error:"Registro não encontrado na empresa." });
 
     const sets = [];
     const params = [];
@@ -322,6 +295,7 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
 
     const changed = new Set(Object.keys(req.body || {}));
 
+    // (não permitimos trocar folha_id/empresa_id por aqui)
     if (req.body?.funcionario_id !== undefined) map("funcionario_id", Number(req.body.funcionario_id));
     if (req.body?.horas_normais !== undefined)  map("horas_normais",  numOrNull(req.body.horas_normais));
     if (req.body?.he50_horas !== undefined)     map("he50_horas",     numOrNull(req.body.he50_horas));
@@ -334,11 +308,10 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
     if (req.body?.total_liquido !== undefined)  map("total_liquido",  numOrNull(req.body.total_liquido));
     if (req.body?.inconsistencias !== undefined)map("inconsistencias",Number(req.body.inconsistencias || 0));
 
-    // Se mudou algum valor monetário e total_liquido não foi enviado, recalcula
+    // recalcula total se necessário
     const monetarios = ["valor_base","valor_he50","valor_he100","descontos","proventos"];
     const tocouMonetario = monetarios.some((k) => changed.has(k));
     const mandouTotal = changed.has("total_liquido");
-
     if (tocouMonetario && !mandouTotal) {
       const [[cur]] = await pool.query(
         `SELECT valor_base, valor_he50, valor_he100, descontos, proventos
@@ -361,32 +334,42 @@ router.put("/folhas-funcionarios/:id", async (req, res) => {
       map("total_liquido", novoTotal);
     }
 
-    if (!sets.length) return res.json({ ok: true, changed: 0 });
+    if (!sets.length) return res.json({ ok:true, changed:0 });
 
     params.push(id);
     await pool.query(`UPDATE folhas_funcionarios SET ${sets.join(", ")} WHERE id = ?`, params);
-    return res.json({ ok: true });
+    return res.json({ ok:true });
   } catch (e) {
     console.error("FF_UPDATE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao atualizar lançamento." });
+    return res.status(400).json({ ok:false, error: e.message || "Falha ao atualizar lançamento." });
   }
 });
 
 /** DELETE /api/folhas-funcionarios/:id */
-router.delete("/folhas-funcionarios/:id", async (req, res) => {
+router.delete("/folhas-funcionarios/:id", requireAuth, async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
-    await ensureFolhaFuncionarioScope(userId, id);
+
+    // valida pertencimento
+    const [[okRow]] = await pool.query(
+      `SELECT 1
+         FROM folhas_funcionarios ff
+         JOIN folhas f ON f.id = ff.folha_id
+        WHERE ff.id = ? AND f.empresa_id = ?
+        LIMIT 1`,
+      [id, empresaId]
+    );
+    if (!okRow) return res.status(404).json({ ok:false, error:"Registro não encontrado na empresa." });
 
     await pool.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
-    return res.json({ ok: true });
+    return res.json({ ok:true });
   } catch (e) {
     if (e?.code === "ER_ROW_IS_REFERENCED_2" || e?.errno === 1451) {
-      return res.status(409).json({ ok: false, error: "Não é possível excluir: registro referenciado." });
+      return res.status(409).json({ ok:false, error:"Não é possível excluir: registro referenciado." });
     }
     console.error("FF_DELETE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao excluir lançamento." });
+    return res.status(400).json({ ok:false, error: e.message || "Falha ao excluir lançamento." });
   }
 });
 
