@@ -11,30 +11,30 @@ const router = Router();
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `
-    SELECT DISTINCT COALESCE(f.empresa_id, up.empresa_id) AS empresa_id
-      FROM usuarios_pessoas up
- LEFT JOIN funcionarios f
-        ON f.pessoa_id = up.pessoa_id
-       AND (f.ativo = 1 OR f.ativo IS NULL)
-     WHERE up.usuario_id = ?
+    SELECT empresa_id
+      FROM empresas_usuarios
+     WHERE usuario_id = ?
+       AND ativo = 1
     `,
     [userId]
   );
   return rows.map(r => r.empresa_id).filter(v => v != null);
 }
 
-/** Resolve a empresa **pela própria folha** e valida acesso do usuário */
 async function resolveEmpresaByFolha(userId, folhaId) {
   const [[folha]] = await pool.query(
     `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
     [Number(folhaId)]
   );
   if (!folha) throw new Error("Folha inexistente.");
+
   const empresasUser = await getUserEmpresaIds(userId);
-  if (!empresasUser.length) throw new Error("Usuário sem vínculo a nenhuma empresa.");
-  if (!empresasUser.includes(folha.empresa_id)) throw new Error("Empresa da folha não autorizada.");
+  if (!empresasUser.includes(folha.empresa_id)) {
+    throw new Error("Usuário não tem acesso à empresa da folha.");
+  }
   return folha.empresa_id;
 }
+
 
 /** Normaliza decimal (aceita "1.234,56" e "1234.56"). */
 function normDec(v) {
