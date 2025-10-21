@@ -1,22 +1,11 @@
 // src/routes/folhas-funcionarios.js
-import { requireAuth } from "../middleware/requireAuth.js";
+import { Router } from "express";
+import { requireAuth } from "../middleware/requireAuth.js"; // popula req.user.id
 import { pool } from "../db.js";
 
 const router = Router();
 
 /* ===================== helpers ===================== */
-
-function requireAuth(req, res, next) {
-  try {
-    const { token } = req.cookies || {};
-    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = payload.sub;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, error: "Sessão inválida." });
-  }
-}
 
 /** Empresas acessíveis ao usuário (mesmo padrão do arquivo apontamentos.js) */
 async function getUserEmpresaIds(userId) {
@@ -98,11 +87,11 @@ function computeTotalLiquido(payload) {
  *  - empresa_id? (opcional: resolvido por contexto se ausente)
  *  - folha_id   (obrigatório)
  *  - funcionario_id? (opcional)
- *  - q? (opcional, busca por inconsistencias; se quiser nome, ver LEFT JOIN funcionários)
+ *  - q? (opcional, busca por inconsistencias)
  */
 router.get("/", requireAuth, async (req, res) => {
   try {
-    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const folhaId = Number(req.query.folha_id);
     const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
     const q = String(req.query.q || "").trim();
@@ -123,7 +112,7 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(`%${q}%`);
     }
 
-    // Garantir que a folha consultada é da empresa
+    // Garante que a folha consultada é da empresa
     const [[chk]] = await pool.query(
       `SELECT id FROM folhas WHERE id = ? AND empresa_id = ? LIMIT 1`,
       [folhaId, empresaId]
@@ -169,7 +158,7 @@ router.get("/", requireAuth, async (req, res) => {
 router.post("/", requireAuth, async (req, res) => {
   let conn;
   try {
-    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const {
       folha_id,
       funcionario_id,
@@ -251,7 +240,7 @@ router.post("/", requireAuth, async (req, res) => {
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
-    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
@@ -351,7 +340,7 @@ router.put("/:id", requireAuth, async (req, res) => {
 router.delete("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
-    const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
+    const empresaId = await resolveEmpresaContext(req.user.id, req.query.empresa_id);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: "ID inválido." });
 
