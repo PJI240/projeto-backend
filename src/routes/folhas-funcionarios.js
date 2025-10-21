@@ -7,7 +7,7 @@ const router = Router();
 
 /* ===================== helpers enxutos ===================== */
 
-/** Empresas acessíveis ao usuário (mantido simples) */
+/** Empresas acessíveis ao usuário (fonte única: empresas_usuarios) */
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `
@@ -18,9 +18,10 @@ async function getUserEmpresaIds(userId) {
     `,
     [userId]
   );
-  return rows.map(r => r.empresa_id).filter(v => v != null);
+  return rows.map((r) => r.empresa_id).filter((v) => v != null);
 }
 
+/** Resolve a empresa pela própria folha e valida se o usuário tem acesso */
 async function resolveEmpresaByFolha(userId, folhaId) {
   const [[folha]] = await pool.query(
     `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
@@ -34,7 +35,6 @@ async function resolveEmpresaByFolha(userId, folhaId) {
   }
   return folha.empresa_id;
 }
-
 
 /** Normaliza decimal (aceita "1.234,56" e "1234.56"). */
 function normDec(v) {
@@ -72,7 +72,7 @@ function computeTotalLiquido(payload) {
 
 /* ===================== GET /api/folhas-funcionarios ===================== */
 /**
- * Parâmetros:
+ * Query params:
  *  - folha_id   (obrigatório)
  *  - funcionario_id? (opcional)
  *  - q? (opcional; pesquisa em 'inconsistencias')
@@ -81,13 +81,17 @@ router.get("/", requireAuth, async (req, res) => {
   try {
     const folhaId = Number(req.query.folha_id);
     if (!folhaId) {
-      return res.status(400).json({ ok: false, error: "Parâmetro 'folha_id' é obrigatório." });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Parâmetro 'folha_id' é obrigatório." });
     }
 
     // empresa é definida pela folha (simples e correto)
     const empresaId = await resolveEmpresaByFolha(req.user.id, folhaId);
 
-    const funcionarioId = req.query.funcionario_id ? Number(req.query.funcionario_id) : null;
+    const funcionarioId = req.query.funcionario_id
+      ? Number(req.query.funcionario_id)
+      : null;
     const q = String(req.query.q || "").trim();
 
     const params = [empresaId, folhaId];
@@ -98,7 +102,7 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(funcionarioId);
     }
     if (q) {
-      // Se q é número, compara direto; senão faz LIKE convertendo para texto
+      // Se q é número, compara direto; senão LIKE convertendo para texto
       const qNum = Number(q);
       if (Number.isFinite(qNum)) {
         extra += " AND ff.inconsistencias = ? ";
@@ -111,35 +115,41 @@ router.get("/", requireAuth, async (req, res) => {
 
     const [rows] = await pool.query(
       `
- SELECT
-    ff.id,
-    ff.empresa_id,
-    ff.folha_id,
-    ff.funcionario_id,
-    ff.horas_normais,
-    ff.he50_horas,
-    ff.he100_horas,
-    ff.valor_base,
-    ff.valor_he50,
-    ff.valor_he100,
-    ff.descontos,
-    ff.proventos,
-    ff.total_liquido,
-    ff.inconsistencias
-  FROM folhas_funcionarios ff
-  WHERE ff.empresa_id = ?
-    AND ff.folha_id   = ?
-       
+      SELECT
+        ff.id,
+        ff.empresa_id,
+        ff.folha_id,
+        ff.funcionario_id,
+        ff.horas_normais,
+        ff.he50_horas,
+        ff.he100_horas,
+        ff.valor_base,
+        ff.valor_he50,
+        ff.valor_he100,
+        ff.descontos,
+        ff.proventos,
+        ff.total_liquido,
+        ff.inconsistencias
+      FROM folhas_funcionarios ff
+      WHERE ff.empresa_id = ?
+        AND ff.folha_id   = ?
         ${extra}
       ORDER BY ff.funcionario_id ASC, ff.id ASC
       `,
       params
     );
 
-    return res.json({ ok: true, empresa_id: empresaId, folha_id: folhaId, folhas_funcionarios: rows });
+    return res.json({
+      ok: true,
+      empresa_id: empresaId,
+      folha_id: folhaId,
+      folhas_funcionarios: rows,
+    });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao listar folhas_funcionarios." });
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Falha ao listar folhas_funcionarios." });
   }
 });
 
@@ -163,11 +173,16 @@ router.post("/", requireAuth, async (req, res) => {
     } = req.body || {};
 
     if (!Number(folha_id) || !Number(funcionario_id)) {
-      return res.status(400).json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
     // empresa vem da própria folha
-    const empresaId = await resolveEmpresaByFolha(req.user.id, Number(folha_id));
+    const empresaId = await resolveEmpresaByFolha(
+      req.user.id,
+      Number(folha_id)
+    );
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -185,9 +200,13 @@ router.post("/", requireAuth, async (req, res) => {
       descontos: normDec(descontos),
       proventos: normDec(proventos),
       total_liquido:
-        total_liquido === null || total_liquido === "" ? null : normDec(total_liquido),
+        total_liquido === null || total_liquido === ""
+          ? null
+          : normDec(total_liquido),
       inconsistencias:
-        inconsistencias === null || inconsistencias === "" ? 0 : toIntOrZero(inconsistencias),
+        inconsistencias === null || inconsistencias === ""
+          ? 0
+          : toIntOrZero(inconsistencias),
     };
     if (payload.total_liquido == null) {
       payload.total_liquido = computeTotalLiquido(payload);
@@ -203,10 +222,19 @@ router.post("/", requireAuth, async (req, res) => {
       VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?)
       `,
       [
-        payload.empresa_id, payload.folha_id, payload.funcionario_id,
-        payload.horas_normais, payload.he50_horas, payload.he100_horas,
-        payload.valor_base, payload.valor_he50, payload.valor_he100,
-        payload.descontos, payload.proventos, payload.total_liquido, payload.inconsistencias
+        payload.empresa_id,
+        payload.folha_id,
+        payload.funcionario_id,
+        payload.horas_normais,
+        payload.he50_horas,
+        payload.he100_horas,
+        payload.valor_base,
+        payload.valor_he50,
+        payload.valor_he100,
+        payload.descontos,
+        payload.proventos,
+        payload.total_liquido,
+        payload.inconsistencias,
       ]
     );
 
@@ -217,9 +245,13 @@ router.post("/", requireAuth, async (req, res) => {
     console.error("FF_CREATE_ERR", e);
     const msg = String(e?.message || "");
     if (/duplicate entry/i.test(msg)) {
-      return res.status(409).json({ ok: false, error: "Conflito de duplicidade." });
+      return res
+        .status(409)
+        .json({ ok: false, error: "Conflito de duplicidade." });
     }
-    return res.status(400).json({ ok: false, error: msg || "Falha ao criar registro." });
+    return res
+      .status(400)
+      .json({ ok: false, error: msg || "Falha ao criar registro." });
   } finally {
     if (conn) conn.release();
   }
@@ -248,16 +280,21 @@ router.put("/:id", requireAuth, async (req, res) => {
     } = req.body || {};
 
     if (!Number(folha_id) || !Number(funcionario_id)) {
-      return res.status(400).json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
     // empresa coerente com a (nova) folha
-    const empresaId = await resolveEmpresaByFolha(req.user.id, Number(folha_id));
+    const empresaId = await resolveEmpresaByFolha(
+      req.user.id,
+      Number(folha_id)
+    );
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Garante que o registro existe (independente da empresa anterior)
+    // Garante que o registro existe
     const [[ex]] = await conn.query(
       `SELECT id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
       [id]
@@ -274,9 +311,13 @@ router.put("/:id", requireAuth, async (req, res) => {
       descontos: normDec(descontos),
       proventos: normDec(proventos),
       total_liquido:
-        total_liquido === null || total_liquido === "" ? null : normDec(total_liquido),
+        total_liquido === null || total_liquido === ""
+          ? null
+          : normDec(total_liquido),
       inconsistencias:
-        inconsistencias === null || inconsistencias === "" ? 0 : toIntOrZero(inconsistencias),
+        inconsistencias === null || inconsistencias === ""
+          ? 0
+          : toIntOrZero(inconsistencias),
     };
     if (payload.total_liquido == null) {
       payload.total_liquido = computeTotalLiquido(payload);
@@ -301,11 +342,20 @@ router.put("/:id", requireAuth, async (req, res) => {
        WHERE id = ?
       `,
       [
-        empresaId, Number(folha_id), Number(funcionario_id),
-        payload.horas_normais, payload.he50_horas, payload.he100_horas,
-        payload.valor_base, payload.valor_he50, payload.valor_he100,
-        payload.descontos, payload.proventos, payload.total_liquido, payload.inconsistencias,
-        id
+        empresaId,
+        Number(folha_id),
+        Number(funcionario_id),
+        payload.horas_normais,
+        payload.he50_horas,
+        payload.he100_horas,
+        payload.valor_base,
+        payload.valor_he50,
+        payload.valor_he100,
+        payload.descontos,
+        payload.proventos,
+        payload.total_liquido,
+        payload.inconsistencias,
+        id,
       ]
     );
 
@@ -316,9 +366,13 @@ router.put("/:id", requireAuth, async (req, res) => {
     console.error("FF_UPDATE_ERR", e);
     const msg = String(e?.message || "");
     if (/duplicad|duplicate entry/i.test(msg)) {
-      return res.status(409).json({ ok: false, error: "Conflito de duplicidade." });
+      return res
+        .status(409)
+        .json({ ok: false, error: "Conflito de duplicidade." });
     }
-    return res.status(400).json({ ok: false, error: msg || "Falha ao atualizar registro." });
+    return res
+      .status(400)
+      .json({ ok: false, error: msg || "Falha ao atualizar registro." });
   } finally {
     if (conn) conn.release();
   }
@@ -348,7 +402,9 @@ router.delete("/:id", requireAuth, async (req, res) => {
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("FF_DELETE_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao excluir registro." });
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message || "Falha ao excluir registro." });
   } finally {
     if (conn) conn.release();
   }
