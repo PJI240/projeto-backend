@@ -1,8 +1,24 @@
 import { Router } from "express";
-import { requireAuth } from "../middleware/requireAuth.js"; // popula req.user.id
+import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
 
 const router = Router();
+
+/* ===================== Auth compatível com perfis_permissoes ===================== */
+function requireAuth(req, res, next) {
+  try {
+    const { token } = req.cookies || {};
+    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = payload.sub;            // <- padrão usado no projeto
+    // compat: se alguém usar req.user?.id em outro lugar
+    req.user = req.user || {};
+    if (req.userId && !req.user.id) req.user.id = req.userId;
+    next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "Sessão inválida." });
+  }
+}
 
 /* ===================== helpers enxutos ===================== */
 
@@ -10,10 +26,10 @@ const router = Router();
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `
-    SELECT eu.empresa_id
-      FROM empresas_usuarios eu
-     WHERE eu.usuario_id = ?
-       AND eu.ativo = 1
+    SELECT empresa_id
+      FROM empresas_usuarios
+     WHERE usuario_id = ?
+       AND ativo = 1
     `,
     [userId]
   );
@@ -26,7 +42,7 @@ async function resolveEmpresaByFolha(userId, folhaId) {
     `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
     [Number(folhaId)]
   );
-  if (!folha) throw new Error("Folha inexistente.");
+  if (!folha) throw Object.assign(new Error("Folha inexistente."), { status: 404 });
 
   const empresasUser = await getUserEmpresaIds(userId);
   if (!empresasUser.includes(folha.empresa_id)) {
@@ -82,7 +98,8 @@ router.get("/", requireAuth, async (req, res) => {
     }
 
     // empresa é definida pela folha (simples e correto)
-    const empresaId = await resolveEmpresaByFolha(req.user.id, folhaId);
+    const userId = req.userId || req.user?.id;
+    const empresaId = await resolveEmpresaByFolha(userId, folhaId);
 
     const funcionarioId = req.query.funcionario_id
       ? Number(req.query.funcionario_id)
@@ -168,10 +185,8 @@ router.post("/", requireAuth, async (req, res) => {
     }
 
     // empresa vem da própria folha
-    const empresaId = await resolveEmpresaByFolha(
-      req.user.id,
-      Number(folha_id)
-    );
+    const userId = req.userId || req.user?.id;
+    const empresaId = await resolveEmpresaByFolha(userId, Number(folha_id));
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -273,25 +288,18 @@ router.put("/:id", requireAuth, async (req, res) => {
     }
 
     // empresa coerente com a (nova) folha
-    const empresaId = await resolveEmpresaByFolha(
-      req.user.id,
-      Number(folha_id)
-    );
+    const userId = req.userId || req.user?.id;
+    const empresaId = await resolveEmpresaByFolha(userId, Number(folha_id));
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Garante que o registro existe e pertence a uma empresa acessível (via folha)
+    // Garante que o registro existe
     const [[ex]] = await conn.query(
-      `
-      SELECT ff.id
-        FROM folhas_funcionarios ff
-        JOIN folhas f ON f.id = ff.folha_id
-       WHERE ff.id = ?
-      `,
+      `SELECT id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
       [id]
     );
-    if (!ex) throw new Error("Registro não encontrado.");
+    if (!ex) throw Object.assign(new Error("Registro não encontrado."), { status: 404 });
 
     const payload = {
       horas_normais: normDec(horas_normais),
@@ -388,9 +396,10 @@ router.delete("/:id", requireAuth, async (req, res) => {
       `,
       [id]
     );
-    if (!reg) throw new Error("Registro não encontrado.");
+    if (!reg) throw Object.assign(new Error("Registro não encontrado."), { status: 404 });
 
-    await resolveEmpresaByFolha(req.user.id, Number(reg.folha_id));
+    const userId = req.userId || req.user?.id;
+    await resolveEmpresaByFolha(userId, Number(reg.folha_id));
 
     await conn.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
 
