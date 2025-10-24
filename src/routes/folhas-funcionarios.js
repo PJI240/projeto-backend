@@ -1,57 +1,11 @@
+// src/routes/folhas-funcionarios.js
 import { Router } from "express";
-import jwt from "jsonwebtoken";
+import { requireAuth } from "../middleware/requireAuth.js"; // se quiser, pode remover
 import { pool } from "../db.js";
 
 const router = Router();
 
-/* ===================== Auth compatível com perfis_permissoes ===================== */
-function requireAuth(req, res, next) {
-  try {
-    const { token } = req.cookies || {};
-    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = payload.sub;            // <- padrão usado no projeto
-    // compat: se alguém usar req.user?.id em outro lugar
-    req.user = req.user || {};
-    if (req.userId && !req.user.id) req.user.id = req.userId;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, error: "Sessão inválida." });
-  }
-}
-
-/* ===================== helpers enxutos ===================== */
-
-/** Empresas acessíveis ao usuário (fonte única: empresas_usuarios) */
-async function getUserEmpresaIds(userId) {
-  const [rows] = await pool.query(
-    `
-    SELECT empresa_id
-      FROM empresas_usuarios
-     WHERE usuario_id = ?
-       AND ativo = 1
-    `,
-    [userId]
-  );
-  return rows.map((r) => r.empresa_id).filter((v) => v != null);
-}
-
-/** Resolve a empresa pela própria folha e valida se o usuário tem acesso */
-async function resolveEmpresaByFolha(userId, folhaId) {
-  const [[folha]] = await pool.query(
-    `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
-    [Number(folhaId)]
-  );
-  if (!folha) throw Object.assign(new Error("Folha inexistente."), { status: 404 });
-
-  const empresasUser = await getUserEmpresaIds(userId);
-  if (!empresasUser.includes(folha.empresa_id)) {
-    const err = new Error("Usuário não tem acesso à empresa da folha.");
-    err.status = 403;
-    throw err;
-  }
-  return folha.empresa_id;
-}
+/* ===================== helpers ===================== */
 
 /** Normaliza decimal (aceita "1.234,56" e "1234.56"). */
 function normDec(v) {
@@ -71,6 +25,12 @@ function toNullOrString(s) {
   return t ? t : null;
 }
 
+function toIntOrZero(v) {
+  if (v == null || v === "") return 0;
+  const n = Number(String(v).replace(/[^\d\-]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
 /** Calcula total líquido se não informado explicitamente */
 function computeTotalLiquido(payload) {
   const vb = normDec(payload.valor_base);
@@ -81,12 +41,22 @@ function computeTotalLiquido(payload) {
   return vb + v50 + v100 + prov - desc;
 }
 
+/** Pega empresa_id da folha (sem validar usuário) */
+async function getEmpresaIdByFolha(folhaId) {
+  const [[folha]] = await pool.query(
+    `SELECT empresa_id FROM folhas WHERE id = ? LIMIT 1`,
+    [Number(folhaId)]
+  );
+  if (!folha) throw new Error("Folha inexistente.");
+  return folha.empresa_id ?? null;
+}
+
 /* ===================== GET /api/folhas-funcionarios ===================== */
 /**
  * Query params:
  *  - folha_id   (obrigatório)
  *  - funcionario_id? (opcional)
- *  - q? (opcional; pesquisa em 'inconsistencias' - texto)
+ *  - q? (opcional; pesquisa em 'inconsistencias' como texto)
  */
 router.get("/", requireAuth, async (req, res) => {
   try {
@@ -97,16 +67,12 @@ router.get("/", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Parâmetro 'folha_id' é obrigatório." });
     }
 
-    // empresa é definida pela folha (simples e correto)
-    const userId = req.userId || req.user?.id;
-    const empresaId = await resolveEmpresaByFolha(userId, folhaId);
-
     const funcionarioId = req.query.funcionario_id
       ? Number(req.query.funcionario_id)
       : null;
     const q = String(req.query.q || "").trim();
 
-    const params = [empresaId, folhaId];
+    const params = [folhaId];
     let extra = "";
 
     if (funcionarioId) {
@@ -114,7 +80,7 @@ router.get("/", requireAuth, async (req, res) => {
       params.push(funcionarioId);
     }
     if (q) {
-      extra += " AND ff.inconsistencias LIKE ? ";
+      extra += " AND CAST(ff.inconsistencias AS CHAR) LIKE ? ";
       params.push(`%${q}%`);
     }
 
@@ -136,8 +102,7 @@ router.get("/", requireAuth, async (req, res) => {
         ff.total_liquido,
         ff.inconsistencias
       FROM folhas_funcionarios ff
-      WHERE ff.empresa_id = ?
-        AND ff.folha_id   = ?
+      WHERE ff.folha_id = ?
         ${extra}
       ORDER BY ff.funcionario_id ASC, ff.id ASC
       `,
@@ -146,15 +111,14 @@ router.get("/", requireAuth, async (req, res) => {
 
     return res.json({
       ok: true,
-      empresa_id: empresaId,
       folha_id: folhaId,
+      count: rows.length,
       folhas_funcionarios: rows,
     });
   } catch (e) {
     console.error("FF_LIST_ERR", e);
-    const status = e?.status || 400;
     return res
-      .status(status)
+      .status(400)
       .json({ ok: false, error: e.message || "Falha ao listar folhas_funcionarios." });
   }
 });
@@ -175,7 +139,7 @@ router.post("/", requireAuth, async (req, res) => {
       descontos = 0,
       proventos = 0,
       total_liquido = null,
-      inconsistencias = null, // TEXTO
+      inconsistencias = null,
     } = req.body || {};
 
     if (!Number(folha_id) || !Number(funcionario_id)) {
@@ -184,9 +148,8 @@ router.post("/", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
-    // empresa vem da própria folha
-    const userId = req.userId || req.user?.id;
-    const empresaId = await resolveEmpresaByFolha(userId, Number(folha_id));
+    // só para preencher a coluna (sem validar usuário)
+    const empresaId = await getEmpresaIdByFolha(Number(folha_id));
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -207,7 +170,7 @@ router.post("/", requireAuth, async (req, res) => {
         total_liquido === null || total_liquido === ""
           ? null
           : normDec(total_liquido),
-      inconsistencias: toNullOrString(inconsistencias), // **TEXTO**
+      inconsistencias: toNullOrString(inconsistencias),
     };
     if (payload.total_liquido == null) {
       payload.total_liquido = computeTotalLiquido(payload);
@@ -250,9 +213,8 @@ router.post("/", requireAuth, async (req, res) => {
         .status(409)
         .json({ ok: false, error: "Conflito de duplicidade." });
     }
-    const status = e?.status || 400;
     return res
-      .status(status)
+      .status(400)
       .json({ ok: false, error: msg || "Falha ao criar registro." });
   } finally {
     if (conn) conn.release();
@@ -278,7 +240,7 @@ router.put("/:id", requireAuth, async (req, res) => {
       descontos = 0,
       proventos = 0,
       total_liquido = null,
-      inconsistencias = null, // TEXTO
+      inconsistencias = null,
     } = req.body || {};
 
     if (!Number(folha_id) || !Number(funcionario_id)) {
@@ -287,9 +249,8 @@ router.put("/:id", requireAuth, async (req, res) => {
         .json({ ok: false, error: "Folha e Funcionário são obrigatórios." });
     }
 
-    // empresa coerente com a (nova) folha
-    const userId = req.userId || req.user?.id;
-    const empresaId = await resolveEmpresaByFolha(userId, Number(folha_id));
+    // empresa coerente com a folha (sem validar usuário)
+    const empresaId = await getEmpresaIdByFolha(Number(folha_id));
 
     conn = await pool.getConnection();
     await conn.beginTransaction();
@@ -299,7 +260,7 @@ router.put("/:id", requireAuth, async (req, res) => {
       `SELECT id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
       [id]
     );
-    if (!ex) throw Object.assign(new Error("Registro não encontrado."), { status: 404 });
+    if (!ex) throw new Error("Registro não encontrado.");
 
     const payload = {
       horas_normais: normDec(horas_normais),
@@ -314,7 +275,7 @@ router.put("/:id", requireAuth, async (req, res) => {
         total_liquido === null || total_liquido === ""
           ? null
           : normDec(total_liquido),
-      inconsistencias: toNullOrString(inconsistencias), // **TEXTO**
+      inconsistencias: toNullOrString(inconsistencias),
     };
     if (payload.total_liquido == null) {
       payload.total_liquido = computeTotalLiquido(payload);
@@ -323,7 +284,7 @@ router.put("/:id", requireAuth, async (req, res) => {
     await conn.query(
       `
       UPDATE folhas_funcionarios
-         SET empresa_id     = ?,   -- mantém coerência com a nova folha
+         SET empresa_id     = ?,   -- acompanha a folha informada
              folha_id       = ?,
              funcionario_id = ?,
              horas_normais  = ?,
@@ -367,9 +328,8 @@ router.put("/:id", requireAuth, async (req, res) => {
         .status(409)
         .json({ ok: false, error: "Conflito de duplicidade." });
     }
-    const status = e?.status || 400;
     return res
-      .status(status)
+      .status(400)
       .json({ ok: false, error: msg || "Falha ao atualizar registro." });
   } finally {
     if (conn) conn.release();
@@ -386,20 +346,12 @@ router.delete("/:id", requireAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Recupera a folha do registro, valida acesso do usuário via empresa
-    const [[reg]] = await conn.query(
-      `
-      SELECT ff.id, ff.folha_id
-        FROM folhas_funcionarios ff
-       WHERE ff.id = ?
-       LIMIT 1
-      `,
+    // Apenas confirma existência antes de excluir
+    const [[ex]] = await conn.query(
+      `SELECT id FROM folhas_funcionarios WHERE id = ? LIMIT 1`,
       [id]
     );
-    if (!reg) throw Object.assign(new Error("Registro não encontrado."), { status: 404 });
-
-    const userId = req.userId || req.user?.id;
-    await resolveEmpresaByFolha(userId, Number(reg.folha_id));
+    if (!ex) throw new Error("Registro não encontrado.");
 
     await conn.query(`DELETE FROM folhas_funcionarios WHERE id = ?`, [id]);
 
@@ -408,9 +360,8 @@ router.delete("/:id", requireAuth, async (req, res) => {
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("FF_DELETE_ERR", e);
-    const status = e?.status || 400;
     return res
-      .status(status)
+      .status(400)
       .json({ ok: false, error: e.message || "Falha ao excluir registro." });
   } finally {
     if (conn) conn.release();
