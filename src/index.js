@@ -125,7 +125,7 @@ app.use("/api", dashboardAdmRoutes);
 app.use("/api/ocorrencias", ocorrenciasRouter);
 app.use("/api", folhasItensRouter);
 app.use("/api", folhasRouter);
-app.use("/api/folhas-funcionarios", folhasFuncionariosRouter);
+app.use("/api", folhasFuncionariosRouter);
 app.use("/api/ptrp", ptrpRoutes);
 
 // Healthcheck
