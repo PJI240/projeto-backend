@@ -1,6 +1,7 @@
+// src/routes/folhas-funcionarios.js
 import express from "express";
-import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
+import { requireAuth } from "../middleware/requireAuth.js"; // usa req.user.id
 
 const router = express.Router();
 
@@ -30,9 +31,9 @@ async function getUserRoles(userId) {
   );
   return rows.map((r) => String(r.perfil || "").toLowerCase());
 }
-function isDev(roles = []) {
-  return roles.map((r) => String(r).toLowerCase()).includes("desenvolvedor");
-}
+const isDev = (roles = []) =>
+  roles.map((r) => String(r).toLowerCase()).includes("desenvolvedor");
+
 async function getUserEmpresaIds(userId) {
   const [rows] = await pool.query(
     `SELECT eu.empresa_id
@@ -40,19 +41,7 @@ async function getUserEmpresaIds(userId) {
       WHERE eu.usuario_id = ? AND eu.ativo = 1`,
     [userId]
   );
-  return rows.map((r) => r.empresa_id);
-}
-
-function requireAuth(req, res, next) {
-  try {
-    const { token } = req.cookies || {};
-    if (!token) return res.status(401).json({ ok: false, error: "Não autenticado." });
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = payload.sub;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, error: "Sessão inválida." });
-  }
+  return rows.map((r) => Number(r.empresa_id));
 }
 
 /** Retorna a folha se estiver no escopo do usuário (empresa vinculada) */
@@ -74,6 +63,7 @@ async function getFolhaIfAllowed(userId, folhaId) {
 
   const empresas = await getUserEmpresaIds(userId);
   if (!empresas.length) throw new Error("Sem empresa vinculada.");
+
   const [[row]] = await pool.query(
     `SELECT id, empresa_id, competencia, status
        FROM folhas
@@ -86,14 +76,15 @@ async function getFolhaIfAllowed(userId, folhaId) {
   return row;
 }
 
-/* ======================= ROTAS PARA O FRONT ======================= */
+/* ======================= ROTAS (escopo /api) ======================= */
 
 router.use(requireAuth);
 
 /** GET /api/folhas -> lista folhas visíveis ao usuário */
 router.get("/folhas", async (req, res) => {
   try {
-    const roles = await getUserRoles(req.userId);
+    const userId = req.user.id;
+    const roles = await getUserRoles(userId);
     const dev = isDev(roles);
 
     let rows;
@@ -104,8 +95,8 @@ router.get("/folhas", async (req, res) => {
          ORDER BY competencia DESC, id DESC`
       );
     } else {
-      const empresas = await getUserEmpresaIds(req.userId);
-      if (!empresas.length) return res.json({ folhas: [] });
+      const empresas = await getUserEmpresaIds(userId);
+      if (!empresas.length) return res.json({ ok: true, folhas: [] });
       [rows] = await pool.query(
         `SELECT id, empresa_id, competencia, status
            FROM folhas
@@ -114,27 +105,27 @@ router.get("/folhas", async (req, res) => {
         [empresas]
       );
     }
-    res.json({ folhas: rows });
+    res.json({ ok: true, folhas: rows });
   } catch (e) {
     console.error("GET /folhas error:", e);
     res.status(500).json({ ok: false, error: "Falha ao listar folhas." });
   }
 });
 
-/** GET /api/folhas/:folhaId -> detalhe da folha (id, empresa_id, competencia, status) */
+/** GET /api/folhas/:folhaId -> detalhe da folha */
 router.get("/folhas/:folhaId", async (req, res) => {
   try {
-    const folha = await getFolhaIfAllowed(req.userId, req.params.folhaId);
-    res.json(folha);
+    const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
+    res.json({ ok: true, folha });
   } catch (e) {
     res.status(404).json({ ok: false, error: e.message || "Folha não encontrada." });
   }
 });
 
-/** GET /api/folhas/:folhaId/funcionarios -> lançamentos da folha (enriquecidos com nome/cpf) */
+/** GET /api/folhas/:folhaId/funcionarios -> lançamentos da folha (com nome/cpf) */
 router.get("/folhas/:folhaId/funcionarios", async (req, res) => {
   try {
-    const folha = await getFolhaIfAllowed(req.userId, req.params.folhaId);
+    const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
     const [rows] = await pool.query(
       `
       SELECT
@@ -163,7 +154,7 @@ router.get("/folhas/:folhaId/funcionarios", async (req, res) => {
       `,
       [folha.id, folha.empresa_id]
     );
-    res.json(rows);
+    res.json({ ok: true, folhas_funcionarios: rows });
   } catch (e) {
     console.error("GET /folhas/:id/funcionarios error:", e);
     res.status(400).json({ ok: false, error: e.message || "Falha ao listar funcionários da folha." });
@@ -173,7 +164,7 @@ router.get("/folhas/:folhaId/funcionarios", async (req, res) => {
 /** GET /api/folhas/:folhaId/candidatos?search=... -> funcionários ativos da mesma empresa e NÃO incluídos */
 router.get("/folhas/:folhaId/candidatos", async (req, res) => {
   try {
-    const folha = await getFolhaIfAllowed(req.userId, req.params.folhaId);
+    const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
     const q = normStr(req.query.search) || "";
     const like = `%${q.replace(/\s+/g, "%")}%`;
 
@@ -204,23 +195,23 @@ router.get("/folhas/:folhaId/candidatos", async (req, res) => {
         : [folha.empresa_id, folha.id, folha.empresa_id]
     );
 
-    res.json(rows);
+    res.json({ ok: true, candidatos: rows });
   } catch (e) {
     console.error("GET /folhas/:id/candidatos error:", e);
     res.status(400).json({ ok: false, error: e.message || "Falha ao buscar candidatos." });
   }
 });
 
-/** POST /api/folhas/:folhaId/funcionarios { funcionario_id } -> inclui (bloqueia se folha fechada) */
+/** POST /api/folhas/:folhaId/funcionarios { funcionario_id } -> inclui (bloqueia se folha FECHADA) */
 router.post("/folhas/:folhaId/funcionarios", async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const folha = await getFolhaIfAllowed(req.userId, req.params.folhaId);
+    const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
     const funcionarioId = Number(req.body?.funcionario_id);
     if (!funcionarioId) return res.status(400).json({ ok: false, error: "Informe funcionario_id." });
 
-    const status = String(folha.status || "").toLowerCase();
-    if (!["rascunho", "aberta", "aberto"].includes(status)) {
+    const st = String(folha.status || "").toUpperCase();
+    if (st !== "ABERTA") {
       return res.status(409).json({ ok: false, error: "Folha não permite novos lançamentos." });
     }
 
@@ -273,7 +264,7 @@ router.post("/folhas/:folhaId/funcionarios", async (req, res) => {
 router.delete("/folhas/:folhaId/funcionarios/:id", async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const folha = await getFolhaIfAllowed(req.userId, req.params.folhaId);
+    const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
     const id = Number(req.params.id);
     await conn.beginTransaction();
 
@@ -304,11 +295,10 @@ router.delete("/folhas/:folhaId/funcionarios/:id", async (req, res) => {
   }
 });
 
-/** POST /api/folhas/:folhaId/funcionarios/recalcular { ids?: number[] }
- *  Stub seguro: confirma OK. Substitua pelo recálculo real quando quiser. */
+/** POST /api/folhas/:folhaId/funcionarios/recalcular { ids?: number[] } -> stub seguro */
 router.post("/folhas/:folhaId/funcionarios/recalcular", async (req, res) => {
   try {
-    const folha = await getFolhaIfAllowed(req.userId, req.params.folhaId);
+    const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
 
     let ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
     if (ids.length === 0) {
@@ -319,7 +309,7 @@ router.post("/folhas/:folhaId/funcionarios/recalcular", async (req, res) => {
       ids = all.map((r) => r.id);
     }
 
-    // TODO: aqui entra sua lógica real de recálculo
+    // TODO: lógica real de recálculo
     res.json({ ok: true, count: ids.length, results: ids.map((id) => ({ id, ok: true })) });
   } catch (e) {
     console.error("POST /folhas/:id/funcionarios/recalcular error:", e);
