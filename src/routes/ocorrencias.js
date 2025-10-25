@@ -24,14 +24,41 @@ function toISO(d) {
   return `${yy}-${mm}-${dd}`;
 }
 
-function toDateOrNull(s) {
-  const v = normStr(s);
+/** Aceita YYYY-MM-DD, DD/MM/YYYY, ISO com hora, Date, timestamp (seg/ms) */
+function toDateOrNull(input) {
+  if (input == null) return null;
+
+  // Date nativo
+  if (input instanceof Date && !isNaN(input)) return fmt(input);
+
+  const v = String(input).trim();
   if (!v) return null;
-  const mIso = v.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+  // BR: DD/MM/YYYY
   const mBr = v.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (mIso) return v;
   if (mBr) return `${mBr[3]}-${mBr[2]}-${mBr[1]}`;
-  return null;
+
+  // ISO (pega só a parte da data)
+  const mIso = v.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (mIso) return mIso[1];
+
+  // Timestamp (segundos ou ms)
+  if (/^\d{10,13}$/.test(v)) {
+    const ms = v.length === 13 ? Number(v) : Number(v) * 1000;
+    const d = new Date(ms);
+    return isNaN(d) ? null : fmt(d);
+  }
+
+  // Fallback: tentar parse do JS
+  const d = new Date(v);
+  return isNaN(d) ? null : fmt(d);
+
+  function fmt(d) {
+    const yy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yy}-${mm}-${dd}`;
+  }
 }
 
 function numOrNull(v) {
@@ -168,12 +195,13 @@ router.get("/", async (req, res) => {
     const where = [];
     const params = [];
 
+    // Usa DATE(o.data) para ficar robusto mesmo que a coluna seja DATETIME
     if (from) {
-      where.push(`o.data >= ?`);
+      where.push(`DATE(o.data) >= ?`);
       params.push(from);
     }
     if (to) {
-      where.push(`o.data <= ?`);
+      where.push(`DATE(o.data) <= ?`);
       params.push(to);
     }
 
@@ -219,10 +247,12 @@ router.get("/", async (req, res) => {
     const [rows] = await pool.query(
       `
       SELECT
-        o.id, o.empresa_id, o.funcionario_id, o.data, o.tipo, o.horas, o.obs,
+        o.id, o.empresa_id, o.funcionario_id,
+        DATE(o.data) AS data,  -- normaliza saída
+        o.tipo, o.horas, o.obs,
         p.nome AS funcionario_nome
       ${sqlBase}
-      ORDER BY o.data DESC, o.id DESC
+      ORDER BY DATE(o.data) DESC, o.id DESC
       LIMIT ? OFFSET ?
       `,
       [...params, limit, offset]
