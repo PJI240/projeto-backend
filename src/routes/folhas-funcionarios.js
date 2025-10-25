@@ -1,7 +1,7 @@
 // src/routes/folhas-funcionarios.js
 import express from "express";
 import { pool } from "../db.js";
-import { requireAuth } from "../middleware/requireAuth.js"; // garante req.user.id
+import { requireAuth } from "../middleware/requireAuth.js";
 
 const router = express.Router();
 
@@ -14,11 +14,6 @@ const normStr = (v) => {
 const onlyYM = (s) => {
   const m = String(s || "").match(/^(\d{4})-(\d{2})$/);
   return m ? `${m[1]}-${m[2]}` : null;
-};
-const numOrNull = (v) => {
-  if (v === "" || v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
 };
 
 async function getUserRoles(userId) {
@@ -44,7 +39,6 @@ async function getUserEmpresaIds(userId) {
   return rows.map((r) => Number(r.empresa_id));
 }
 
-/** Retorna a folha se estiver no escopo do usuário (empresa vinculada) */
 async function getFolhaIfAllowed(userId, folhaId) {
   const roles = await getUserRoles(userId);
   const dev = isDev(roles);
@@ -76,7 +70,6 @@ async function getFolhaIfAllowed(userId, folhaId) {
   return row;
 }
 
-/** Retorna {from,to} (YYYY-MM-DD) cobrindo todo o mês de uma competência YYYY-MM */
 function monthRange(competenciaYM) {
   const [y, m] = String(competenciaYM).split("-").map(Number);
   const from = new Date(Date.UTC(y, m - 1, 1));
@@ -86,11 +79,13 @@ function monthRange(competenciaYM) {
   return { from: iso(from), to: iso(to) };
 }
 
+const DAILY_NORM_MIN = 8 * 60;
+
 /* ======================= ROTAS (escopo /api) ======================= */
 
 router.use(requireAuth);
 
-/** GET /api/folhas -> lista folhas visíveis ao usuário */
+/** GET /api/folhas */
 router.get("/folhas", async (req, res) => {
   try {
     const userId = req.user.id;
@@ -122,7 +117,7 @@ router.get("/folhas", async (req, res) => {
   }
 });
 
-/** GET /api/folhas/:folhaId -> detalhe da folha */
+/** GET /api/folhas/:folhaId */
 router.get("/folhas/:folhaId", async (req, res) => {
   try {
     const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
@@ -132,7 +127,7 @@ router.get("/folhas/:folhaId", async (req, res) => {
   }
 });
 
-/** GET /api/folhas/:folhaId/funcionarios -> lançamentos da folha (com nome/cpf) */
+/** GET /api/folhas/:folhaId/funcionarios */
 router.get("/folhas/:folhaId/funcionarios", async (req, res) => {
   try {
     const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
@@ -171,7 +166,7 @@ router.get("/folhas/:folhaId/funcionarios", async (req, res) => {
   }
 });
 
-/** GET /api/folhas/:folhaId/candidatos?search=... -> funcionários ativos da mesma empresa e NÃO incluídos */
+/** GET /api/folhas/:folhaId/candidatos */
 router.get("/folhas/:folhaId/candidatos", async (req, res) => {
   try {
     const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
@@ -212,7 +207,7 @@ router.get("/folhas/:folhaId/candidatos", async (req, res) => {
   }
 });
 
-/** POST /api/folhas/:folhaId/funcionarios { funcionario_id } -> inclui (bloqueia se folha FECHADA) */
+/** POST /api/folhas/:folhaId/funcionarios */
 router.post("/folhas/:folhaId/funcionarios", async (req, res) => {
   const conn = await pool.getConnection();
   try {
@@ -227,7 +222,6 @@ router.post("/folhas/:folhaId/funcionarios", async (req, res) => {
 
     await conn.beginTransaction();
 
-    // funcionário precisa ser da mesma empresa e ativo
     const [[fok]] = await conn.query(
       `SELECT id FROM funcionarios WHERE id = ? AND empresa_id = ? AND ativo = 1 LIMIT 1`,
       [funcionarioId, folha.empresa_id]
@@ -237,7 +231,6 @@ router.post("/folhas/:folhaId/funcionarios", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Funcionário inválido para esta empresa." });
     }
 
-    // evitar duplicidade
     const [[dup]] = await conn.query(
       `SELECT id FROM folhas_funcionarios WHERE folha_id = ? AND empresa_id = ? AND funcionario_id = ? LIMIT 1`,
       [folha.id, folha.empresa_id, funcionarioId]
@@ -270,7 +263,7 @@ router.post("/folhas/:folhaId/funcionarios", async (req, res) => {
   }
 });
 
-/** DELETE /api/folhas/:folhaId/funcionarios/:id -> remove lançamento da folha (scoped) */
+/** DELETE /api/folhas/:folhaId/funcionarios/:id */
 router.delete("/folhas/:folhaId/funcionarios/:id", async (req, res) => {
   const conn = await pool.getConnection();
   try {
@@ -305,24 +298,21 @@ router.delete("/folhas/:folhaId/funcionarios/:id", async (req, res) => {
   }
 });
 
-/* ======================= REGRA DE CÁLCULO =======================
-   - Domingo (DAYOFWEEK = 1): tudo HE100
-   - Seg–Sáb (2–7): até 8h/dia = horas_normais; excedente = HE50
-   - valor_hora: funcionarios.valor_hora; se nulo, salario_base/220; senão 0
-   - valores: base = vHora * horas_normais
-              he50  = vHora * 1.5 * he50_horas
-              he100 = vHora * 2.0 * he100_horas
+/* ======================= RECÁLCULO (pareamento idêntico ao relatório) =======================
+   1) Busca eventos (duas consultas unificadas: ENTRADA e SAIDA) — exclui origem INVALIDADA
+   2) Agrupa por funcionario|data|turno, ordena por horário e pareia ENTRADA→SAIDA
+   3) Soma duração por dia e aplica:
+        - Domingo (DAYOFWEEK=1): tudo HE100
+        - Seg–Sáb (2..7): até 8h = normal, excedente = HE50
+   4) valor_hora = funcionarios.valor_hora || (salario_base>0 ? salario_base/220 : 0)
 */
-const DAILY_NORM_HOURS = 8;
-
-/** POST /api/folhas/:folhaId/funcionarios/recalcular { ids?: number[] } */
 router.post("/folhas/:folhaId/funcionarios/recalcular", async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const folha = await getFolhaIfAllowed(req.user.id, req.params.folhaId);
     const { from, to } = monthRange(folha.competencia);
 
-    // targets
+    // alvos
     let ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
     if (ids.length === 0) {
       const [all] = await pool.query(
@@ -331,19 +321,18 @@ router.post("/folhas/:folhaId/funcionarios/recalcular", async (req, res) => {
       );
       ids = all.map((r) => r.id);
     }
-    if (ids.length === 0) return res.json({ ok: true, count: 0, results: [] });
+    if (!ids.length) return res.json({ ok: true, count: 0, results: [] });
 
     await conn.beginTransaction();
 
-    // 1) Metadados dos lançamentos + valor_hora (fallback salario_base/220)
+    // metadados de ff + valor_hora
     const [ffRows] = await conn.query(
       `
       SELECT
         ff.id,
         ff.funcionario_id,
-        ff.empresa_id,
         COALESCE(func.valor_hora,
-                 CASE WHEN func.salario_base > 0 THEN func.salario_base / 220 ELSE 0 END,
+                 CASE WHEN func.salario_base > 0 THEN func.salario_base/220 ELSE 0 END,
                  0) AS valor_hora
       FROM folhas_funcionarios ff
       JOIN funcionarios func
@@ -355,145 +344,150 @@ router.post("/folhas/:folhaId/funcionarios/recalcular", async (req, res) => {
       `,
       [...ids, folha.id, folha.empresa_id]
     );
-
-    if (ffRows.length === 0) {
+    if (!ffRows.length) {
       await conn.rollback();
-      return res.status(404).json({ ok: false, error: "Nenhum lançamento encontrado na folha." });
+      return res.status(404).json({ ok: false, error: "Nenhum lançamento encontrado." });
     }
+    const byFF = new Map(ffRows.map((r) => [r.id, r]));
+    const funcIds = [...new Set(ffRows.map((r) => r.funcionario_id))];
 
-    const funcIds = ffRows.map((r) => r.funcionario_id);
-    const byFFId = new Map(ffRows.map((r) => [r.id, r]));
-
-    // 2) Minutos por dia/funcionário no período (ajuste para virada de dia)
+    // eventos (ENTRADA/SAIDA) — exclui INVALIDADA
     const placeholders = funcIds.map(() => "?").join(",");
-    const [minPorDia] = await conn.query(
+    const [eventRows] = await conn.query(
       `
-      SELECT
-        a.funcionario_id,
-        a.data AS data,
-        DAYOFWEEK(a.data) AS dow, -- 1=Domingo, 2=Seg, ..., 7=Sáb
-        SUM(
-          CASE
-            WHEN a.entrada IS NOT NULL AND a.saida IS NOT NULL THEN
-              GREATEST(
-                TIMESTAMPDIFF(
-                  MINUTE,
-                  CONCAT(a.data,' ', a.entrada),
-                  CASE
-                    WHEN a.saida >= a.entrada
-                      THEN CONCAT(a.data,' ', a.saida)
-                    ELSE DATE_ADD(CONCAT(a.data,' ', a.saida), INTERVAL 1 DAY)
-                  END
-                ),
-                0
-              )
-            ELSE 0
-          END
-        ) AS minutos
-      FROM apontamentos a
-      WHERE a.empresa_id = ?
-        AND a.data BETWEEN ? AND ?
-        AND a.funcionario_id IN (${placeholders})
-      GROUP BY a.funcionario_id, a.data, dow
-      ORDER BY a.funcionario_id, a.data
+      SELECT funcionario_id, data, turno_ordem,
+             'ENTRADA' AS evento, entrada AS horario,
+             DAYOFWEEK(data) AS dow
+        FROM apontamentos
+       WHERE empresa_id = ?
+         AND data BETWEEN ? AND ?
+         AND funcionario_id IN (${placeholders})
+         AND origem <> 'INVALIDADA'
+         AND entrada IS NOT NULL
+
+      UNION ALL
+      SELECT funcionario_id, data, turno_ordem,
+             'SAIDA' AS evento, saida AS horario,
+             DAYOFWEEK(data) AS dow
+        FROM apontamentos
+       WHERE empresa_id = ?
+         AND data BETWEEN ? AND ?
+         AND funcionario_id IN (${placeholders})
+         AND origem <> 'INVALIDADA'
+         AND saida IS NOT NULL
+
+       ORDER BY funcionario_id, data, turno_ordem, horario
       `,
-      [folha.empresa_id, from, to, ...funcIds]
+      [folha.empresa_id, from, to, ...funcIds, folha.empresa_id, from, to, ...funcIds]
     );
 
-    // 3) Agrega por funcionário: separa normais, he50 e he100
-    const normMinByFunc = new Map();  // funcionario_id -> minutos
-    const he50MinByFunc = new Map();
-    const he100MinByFunc = new Map();
+    // === pareamento idêntico ao front ===
+    const key = (r) => `${r.funcionario_id}|${r.data}|${r.turno_ordem}`;
+    const buckets = new Map();
+    for (const ev of eventRows) {
+      const k = key(ev);
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push(ev);
+    }
 
-    for (const row of minPorDia) {
-      const fid = Number(row.funcionario_id);
-      const dow = Number(row.dow);
-      const minutos = Math.max(Number(row.minutos || 0), 0);
+    // minutos por dia/func
+    const dayMinByFunc = new Map(); // map(funcId -> Map(data -> { dow, min }))
+    function mins(hhmm) {
+      if (!hhmm) return 0;
+      const [h, m] = String(hhmm).split(":").map(Number);
+      return h * 60 + (m || 0);
+    }
 
-      if (dow === 1) {
-        // Domingo: tudo HE100
-        he100MinByFunc.set(fid, (he100MinByFunc.get(fid) || 0) + minutos);
-      } else {
-        // Seg–Sáb: até 8h normais, excedente HE50
-        const dailyCap = DAILY_NORM_HOURS * 60;
-        const norm = Math.min(minutos, dailyCap);
-        const extra = Math.max(minutos - norm, 0);
-        normMinByFunc.set(fid, (normMinByFunc.get(fid) || 0) + norm);
-        he50MinByFunc.set(fid, (he50MinByFunc.get(fid) || 0) + extra);
+    for (const [k2, arr] of buckets.entries()) {
+      arr.sort((a, b) => (a.horario || "").localeCompare(b.horario || ""));
+      for (let i = 0; i < arr.length; i++) {
+        const a = arr[i];
+        if (a.evento !== "ENTRADA") continue;
+        const b = arr[i + 1];
+        if (b && b.evento === "SAIDA") {
+          const dur = Math.max(0, mins(b.horario) - mins(a.horario)); // **sem virada de dia**, igual ao relatório
+          if (!dayMinByFunc.has(a.funcionario_id)) dayMinByFunc.set(a.funcionario_id, new Map());
+          const dmap = dayMinByFunc.get(a.funcionario_id);
+          const cur = dmap.get(a.data) || { dow: a.dow, min: 0 };
+          cur.min += dur;
+          dmap.set(a.data, cur);
+          i++; // consome a SAIDA
+        } else {
+          // ENTRADA sem SAIDA -> duração 0 (igual ao relatório)
+        }
       }
     }
 
-    // 4) Aplica nos FF e calcula valores
+    // agrega por funcionário: normal/he50/he100
+    const normMin = new Map(), he50Min = new Map(), he100Min = new Map();
+    for (const [fid, dmap] of dayMinByFunc.entries()) {
+      for (const [_, { dow, min }] of dmap.entries()) {
+        if (dow === 1) {
+          he100Min.set(fid, (he100Min.get(fid) || 0) + min);
+        } else {
+          const n = Math.min(min, DAILY_NORM_MIN);
+          const e = Math.max(min - DAILY_NORM_MIN, 0);
+          normMin.set(fid, (normMin.get(fid) || 0) + n);
+          he50Min.set(fid, (he50Min.get(fid) || 0) + e);
+        }
+      }
+    }
+
+    // aplica em cada FF
     const results = [];
     for (const ffId of ids) {
-      const meta = byFFId.get(ffId);
+      const meta = byFF.get(ffId);
       if (!meta) {
         results.push({ id: ffId, ok: false, error: "Lançamento não pertence à folha." });
         continue;
       }
-
       const fid = meta.funcionario_id;
       const vHora = Number(meta.valor_hora || 0);
 
-      const horas_normais = (normMinByFunc.get(fid) || 0) / 60;
-      const he50_horas    = (he50MinByFunc.get(fid) || 0) / 60;
-      const he100_horas   = (he100MinByFunc.get(fid) || 0) / 60;
+      const hNorm  = (normMin.get(fid)  || 0) / 60;
+      const hHe50  = (he50Min.get(fid)  || 0) / 60;
+      const hHe100 = (he100Min.get(fid) || 0) / 60;
 
-      const valor_base  = vHora * horas_normais;
-      const valor_he50  = vHora * 1.5 * he50_horas;
-      const valor_he100 = vHora * 2.0 * he100_horas;
+      const valor_base  = vHora * hNorm;
+      const valor_he50  = vHora * 1.5 * hHe50;
+      const valor_he100 = vHora * 2.0 * hHe100;
 
-      const proventos      = valor_base + valor_he50 + valor_he100;
-      const descontos      = 0;
-      const total_liquido  = proventos - descontos;
+      const proventos     = valor_base + valor_he50 + valor_he100;
+      const descontos     = 0;
+      const total_liquido = proventos - descontos;
 
       await conn.query(
-        `
-        UPDATE folhas_funcionarios
-           SET horas_normais  = ?,
-               he50_horas     = ?,
-               he100_horas    = ?,
-               valor_base     = ?,
-               valor_he50     = ?,
-               valor_he100    = ?,
-               proventos      = ?,
-               descontos      = ?,
-               total_liquido  = ?,
-               inconsistencias = 0
-         WHERE id = ?
-        `,
-        [
-          horas_normais,
-          he50_horas,
-          he100_horas,
-          valor_base,
-          valor_he50,
-          valor_he100,
-          proventos,
-          descontos,
-          total_liquido,
-          ffId,
-        ]
+        `UPDATE folhas_funcionarios
+            SET horas_normais = ?,
+                he50_horas    = ?,
+                he100_horas   = ?,
+                valor_base    = ?,
+                valor_he50    = ?,
+                valor_he100   = ?,
+                proventos     = ?,
+                descontos     = ?,
+                total_liquido = ?,
+                inconsistencias = 0
+          WHERE id = ?`,
+        [hNorm, hHe50, hHe100, valor_base, valor_he50, valor_he100, proventos, descontos, total_liquido, ffId]
       );
 
       results.push({
-        id: ffId,
-        ok: true,
+        id: ffId, ok: true,
         valor_hora: vHora,
-        horas_normais,
-        he50_horas,
-        he100_horas,
-        proventos,
-        total_liquido,
+        horas_normais: hNorm,
+        he50_horas: hHe50,
+        he100_horas: hHe100,
+        proventos, total_liquido
       });
     }
 
     await conn.commit();
-    return res.json({ ok: true, count: results.length, results, period: { from, to } });
+    res.json({ ok: true, count: results.length, results, period: { from, to } });
   } catch (e) {
     await (conn?.rollback?.());
     console.error("RECALC_ERR", e);
-    return res.status(400).json({ ok: false, error: e.message || "Falha ao recalcular." });
+    res.status(400).json({ ok: false, error: e.message || "Falha ao recalcular." });
   } finally {
     conn.release();
   }
