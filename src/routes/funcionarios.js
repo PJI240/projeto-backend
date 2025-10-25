@@ -6,7 +6,6 @@ import { pool } from "../db.js";
 const router = Router();
 
 /* ========= helpers ========= */
-
 function requireAuth(req, res, next) {
   try {
     const { token } = req.cookies || {};
@@ -29,11 +28,7 @@ async function getUserEmpresaIds(userId) {
   return rows.map((r) => r.empresa_id);
 }
 
-/** 
- * Resolve a empresa “corrente”:
- * - se empresa_id foi passado e o usuário tem vínculo → usa
- * - senão, usa a 1ª empresa vinculada
- */
+/** Resolve empresa corrente (verifica vínculo) */
 async function resolveEmpresaContext(userId, empresaIdQuery) {
   const empresas = await getUserEmpresaIds(userId);
   if (!empresas.length) throw new Error("Usuário sem empresa vinculada.");
@@ -46,17 +41,46 @@ async function resolveEmpresaContext(userId, empresaIdQuery) {
   return empresas[0];
 }
 
+/** Normaliza regime */
 function normRegime(v) {
   const R = String(v || "MENSALISTA").toUpperCase();
   return ["HORISTA", "DIARISTA", "MENSALISTA"].includes(R) ? R : "MENSALISTA";
 }
 
+/** Recalcula salário_base / valor_hora coerentemente */
+function computeValores(regime, salario_base, valor_hora) {
+  let base = salario_base == null ? null : Number(salario_base);
+  let hora = valor_hora == null ? null : Number(valor_hora);
+
+  if (isNaN(base)) base = null;
+  if (isNaN(hora)) hora = null;
+
+  // Regras de coerência
+  switch (normRegime(regime)) {
+    case "MENSALISTA":
+      if (base && !hora) hora = base / 220;
+      if (hora && !base) base = hora * 220;
+      break;
+    case "HORISTA":
+      if (!hora && base) hora = base; // hora = base (interpreta salário_base = valor/hora)
+      if (!base && hora) base = hora * 220; // salário base estimado
+      break;
+    case "DIARISTA":
+      // Considera 8h por dia, 22 dias por mês
+      if (base && !hora) hora = base / (22 * 8);
+      if (hora && !base) base = hora * 22 * 8;
+      break;
+  }
+
+  return {
+    salario_base: base ? Number(base.toFixed(2)) : null,
+    valor_hora: hora ? Number(hora.toFixed(4)) : null,
+  };
+}
+
 /* ========= rotas ========= */
 
-/**
- * GET /api/funcionarios?empresa_id=OPC
- * Lista funcionários da empresa, com nome da pessoa e do cargo.
- */
+/** GET /api/funcionarios?empresa_id= */
 router.get("/", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
@@ -83,12 +107,7 @@ router.get("/", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * POST /api/funcionarios
- * Body: { pessoa_id, cargo_id, regime, salario_base?, valor_hora?, ativo? }
- * Cria o vínculo na empresa “corrente”.
- * Respeita UNIQUE (empresa_id, pessoa_id).
- */
+/** POST /api/funcionarios */
 router.post("/", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -106,22 +125,24 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Pessoa e Cargo são obrigatórios." });
     }
 
+    const { salario_base: baseFinal, valor_hora: horaFinal } = computeValores(
+      regime,
+      salario_base,
+      valor_hora
+    );
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // valida pessoa existe
     const [[pOk]] = await conn.query(`SELECT id FROM pessoas WHERE id = ? LIMIT 1`, [pessoa_id]);
     if (!pOk) throw new Error("Pessoa inexistente.");
 
-    // valida cargo pertence à empresa
     const [[cOk]] = await conn.query(
       `SELECT id FROM cargos WHERE id = ? AND empresa_id = ? LIMIT 1`,
       [cargo_id, empresaId]
     );
     if (!cOk) throw new Error("Cargo não pertence à empresa.");
 
-    // impede duplicidade pelo UNIQUE(empresa_id, pessoa_id)
-    // tenta inserir
     await conn.query(
       `
       INSERT INTO funcionarios
@@ -133,14 +154,14 @@ router.post("/", requireAuth, async (req, res) => {
         Number(pessoa_id),
         Number(cargo_id),
         normRegime(regime),
-        salario_base === "" || salario_base == null ? null : Number(salario_base),
-        valor_hora === "" || valor_hora == null ? null : Number(valor_hora),
+        baseFinal,
+        horaFinal,
         ativo ? 1 : 0,
       ]
     );
 
     await conn.commit();
-    return res.json({ ok: true });
+    return res.json({ ok: true, salario_base: baseFinal, valor_hora: horaFinal });
   } catch (e) {
     if (conn) await conn.rollback();
     const msg = String(e?.message || "");
@@ -154,10 +175,7 @@ router.post("/", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * PUT /api/funcionarios/:id
- * Atualiza o vínculo (somente dentro da empresa do usuário).
- */
+/** PUT /api/funcionarios/:id */
 router.put("/:id", requireAuth, async (req, res) => {
   let conn;
   try {
@@ -172,17 +190,21 @@ router.put("/:id", requireAuth, async (req, res) => {
       ativo = 1,
     } = req.body || {};
 
+    const { salario_base: baseFinal, valor_hora: horaFinal } = computeValores(
+      regime,
+      salario_base,
+      valor_hora
+    );
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // garante que o funcionário pertence à empresa
     const [[fOk]] = await conn.query(
       `SELECT id FROM funcionarios WHERE id = ? AND empresa_id = ? LIMIT 1`,
       [id, empresaId]
     );
     if (!fOk) throw new Error("Funcionário não encontrado na empresa.");
 
-    // se trocar cargo, valida que pertence à empresa
     if (cargo_id) {
       const [[cOk]] = await conn.query(
         `SELECT id FROM cargos WHERE id = ? AND empresa_id = ? LIMIT 1`,
@@ -204,15 +226,15 @@ router.put("/:id", requireAuth, async (req, res) => {
       [
         cargo_id ? Number(cargo_id) : null,
         normRegime(regime),
-        salario_base === "" || salario_base == null ? null : Number(salario_base),
-        valor_hora === "" || valor_hora == null ? null : Number(valor_hora),
+        baseFinal,
+        horaFinal,
         ativo ? 1 : 0,
         id,
       ]
     );
 
     await conn.commit();
-    return res.json({ ok: true });
+    return res.json({ ok: true, salario_base: baseFinal, valor_hora: horaFinal });
   } catch (e) {
     if (conn) await conn.rollback();
     console.error("FUNC_UPDATE_ERR", e);
@@ -222,16 +244,12 @@ router.put("/:id", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/funcionarios/:id
- * Remove o vínculo (pertencente à empresa do usuário).
- */
+/** DELETE /api/funcionarios/:id */
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const empresaId = await resolveEmpresaContext(req.userId, req.query.empresa_id);
     const id = Number(req.params.id);
 
-    // só permite deletar se o registro é desta empresa
     const [result] = await pool.query(
       `DELETE FROM funcionarios WHERE id = ? AND empresa_id = ?`,
       [id, empresaId]
